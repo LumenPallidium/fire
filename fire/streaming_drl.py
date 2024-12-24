@@ -3,6 +3,82 @@ from torch.optim import Optimizer
 from typing import List, Optional
 from torch import Tensor
 
+def custom_sparse_init(tensor, sparsity = 0.1):
+    with torch.no_grad():
+        fan_in = tensor.size(1)
+        scale = 1 / fan_in
+        tensor.data.uniform_(-1, 1).mul_(scale)
+        mask = torch.rand_like(tensor) > sparsity
+        tensor.data *= mask
+        tensor.data /= torch.sqrt(fan_in)
+
+class SparseLinear(torch.nn.Module):
+    def __init__(self, in_features, out_features, sparsity = 0.9):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = torch.nn.Parameter(torch.empty(out_features))
+        self.reset_parameters(sparsity)
+
+    def reset_parameters(self, sparsity):
+        custom_sparse_init(self.weight, sparsity)
+        self.bias.data.zero_()
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight, self.bias)
+
+def _running_mean_var(x, mean, p, n, add_batch = True):
+    """
+    Based on Welford's online algorithm. p is an unscaled
+    variance estimator.
+    """
+    if len(x.shape) == 1 and add_batch:
+        x = x.unsqueeze(0)
+    n += 1
+    mean_bar = mean + (x - mean) / n
+    #TODO : could make this a matrix and get covariance
+    p += ((x - mean) * (x - mean_bar)).mean(dim = 0)
+    var = p / (n-1) if n > 1 else torch.tensor(1)
+    return mean_bar, var, n
+
+class RewardScaler(torch.nn.Module):
+    def __init__(self, decay):
+        super().__init__()
+        self.decay = decay
+        self.register_buffer("u", torch.zeros(1))
+        self.register_buffer("p", torch.zeros(1))
+        self.register_buffer("n", torch.zeros(1))
+
+    def forward(self, reward, terminal = 0):
+        """
+        Scale the reward. terminal is a binary flag indicating
+        whether the episode is over.
+        """
+        with torch.no_grad():
+            u = reward + self.decay * (1 - terminal) * self.u
+            _, var, self.n = _running_mean_var(u, 0, self.p, self.n, add_batch = False)
+            self.u = u
+        return reward / torch.sqrt(var + 1e-8)
+    
+class ObsScaler(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.register_buffer("mean", torch.zeros(dim))
+        self.register_buffer("p", torch.zeros(dim))
+        self.register_buffer("n", torch.zeros(1))
+
+    def forward(self, obs, update = True):
+        with torch.no_grad():
+            mean, var, n = _running_mean_var(obs, self.mean, self.p, self.n)
+        if update:
+            self.mean = mean
+            self.var = var
+            self.n = n
+        return (obs - mean) / torch.sqrt(var + 1e-8)
+    
+
 def _obgd(
     params: List[Tensor],
     eligbility_traces : List[Tensor],
@@ -130,61 +206,13 @@ class ObGD(Optimizer):
         return loss
     
 
-def _running_mean_var(x, mean, p, n, add_batch = True):
-    """
-    Based on Welford's online algorithm. p is an unscaled
-    variance estimator.
-    """
-    if len(x.shape) == 1 and add_batch:
-        x = x.unsqueeze(0)
-    n += 1
-    mean_bar = mean + (x - mean) / n
-    #TODO : could make this a matrix and get covariance
-    p += ((x - mean) * (x - mean_bar)).mean(dim = 0)
-    var = p / (n-1) if n > 1 else torch.tensor(1)
-    return mean_bar, var, n
-
-class RewardScaler(torch.nn.Module):
-    def __init__(self, decay):
-        super().__init__()
-        self.decay = decay
-        self.register_buffer("u", torch.zeros(1))
-        self.register_buffer("p", torch.zeros(1))
-        self.register_buffer("n", torch.zeros(1))
-
-    def forward(self, reward, terminal = 0):
-        """
-        Scale the reward. terminal is a binary flag indicating
-        whether the episode is over.
-        """
-        u = reward + self.decay * (1 - terminal) * self.u
-        _, var, self.n = _running_mean_var(u, 0, self.p, self.n, add_batch = False)
-        self.u = u
-        return reward / torch.sqrt(var + 1e-8)
-    
-class ObsScaler(torch.nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        self.register_buffer("mean", torch.zeros(dim))
-        self.register_buffer("p", torch.zeros(dim))
-        self.register_buffer("n", torch.zeros(1))
-
-    def forward(self, obs, update = True):
-        mean, var, n = _running_mean_var(obs, self.mean, self.p, self.n)
-        if update:
-            self.mean = mean
-            self.var = var
-            self.n = n
-        return (obs - mean) / torch.sqrt(var + 1e-8)
-
 if __name__ == "__main__":
     actor = torch.nn.Sequential(
         ObsScaler(4),
-        torch.nn.Linear(4, 2))
+        SparseLinear(4, 2))
     critic =  torch.nn.Sequential(
         ObsScaler(4),
-        torch.nn.Linear(4, 1))
+        SparseLinear(4, 1))
     reward_scaler = RewardScaler(0.99)
 
     optimizer = ObGD(list(actor.parameters()) + list(critic.parameters()), lr=1e-3, momentum=0.9)
