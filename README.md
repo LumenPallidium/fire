@@ -2,7 +2,7 @@
 Repository for experiments with artificial agency (e.g. RL, intrinsic motivation)
 
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300">
-  <!-- Background gradient -->
+
   <defs>
     <linearGradient id="fireGradient" x1="0%" y1="100%" x2="100%" y2="0%">
       <stop offset="0%" style="stop-color:#FF4500"/>
