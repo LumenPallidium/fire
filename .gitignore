@@ -169,3 +169,18 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# folders
+/data
+/fire/temp
+
+# data files
+*.csv
+*.zip
+*.log
+*.vocab
+*.model
+
+# Mac Specific Files
+*.DS_Store
+
