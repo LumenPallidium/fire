@@ -172,7 +172,8 @@ cython_debug/
 
 # folders
 /data
-/fire/temp
+/fire/tmp
+
 
 # data files
 *.csv
