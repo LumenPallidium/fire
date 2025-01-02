@@ -105,53 +105,6 @@ class ObsScaler(torch.nn.Module):
         return scale_obs.view(obs_shape)
     
 
-def _obgd(
-    params: List[Tensor],
-    eligbility_traces : List[Tensor],
-    grads: List[Tensor],
-    error: List[Tensor],
-    momentum_buffer_list: List[Optional[Tensor]],
-    grad_scale: Optional[Tensor],
-    found_inf: Optional[Tensor],
-    *,
-    momentum: float,
-    lr: float,
-    scaling_factor : float,
-    discount_factor: float,
-    eligibility_trace_decay: float,
-    maximize: bool,
-):
-    """
-    Single step of the (adaptive) Overshooting-bounded Gradient Descent (ObGD) optimizer.
-    """
-    assert grad_scale is None and found_inf is None
-    with torch.no_grad():
-        for i, param in enumerate(params):
-            grad = grads[i] if maximize else -grads[i]
-            eligibility_scaler = eligibility_trace_decay * discount_factor
-            eligbility_traces[i].mul_(eligibility_scaler).add_(grad)
-
-            if momentum != 0:
-                buf = momentum_buffer_list[i]
-
-                if buf is None:
-                    buf = ((error * eligbility_traces[i])**2).detach()
-                    momentum_buffer_list[i] = buf
-                else:
-                    buf.mul_(momentum).add_((error * eligbility_traces[i])**2,
-                                            alpha = 1 - momentum)
-                    
-                sqrt_momentum = torch.sqrt(buf + 1e-8)
-            else:
-                sqrt_momentum = 1
-
-            scaled_error = torch.maximum(error.abs(), torch.tensor(1)).mean()
-            et_scaled = eligbility_traces[i] / sqrt_momentum
-            #TODO : might not be sum here - maybe keep batch
-            momentum_scale = scaling_factor * scaled_error * et_scaled.abs().sum()
-            lr_ = min(lr, 1 / (momentum_scale.item() + 1))
-
-            param.data.add_(et_scaled, alpha=lr_ * error.mean().item())
 
 class ObGD(Optimizer):
     def __init__(self,
@@ -187,49 +140,65 @@ class ObGD(Optimizer):
     def __setstate__(self, state):
         super().__setstate__(state)
 
-    # mostly following official PyTorch SGD implementation
-    def step(self, td_error, reset_eligibility = False, closure=None):
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
+    def _update_et_momentum(self, momentum, td_error):
+        et_sum = 0
         for group in self.param_groups:
-            params: List[Tensor] = []
-            grads: List[Tensor] = []
-            eligbility_traces: List[Tensor] = []
-            momentum_buffer_list: List[Optional[Tensor]] = []
-
             for p in group["params"]:
-                if p.grad is not None:
-                    params.append(p)
-                    grads.append(p.grad)
-                    if reset_eligibility:
-                        eligbility_traces.append(torch.zeros_like(p))
+                if p.grad is None:
+                    continue
+                grad = p.grad if group["maximize"] else -p.grad
+                eligbility_trace = self.state[p].get("eligibility_trace",
+                                                        torch.zeros_like(p))
+                eligibility_scaler = self.eligibility_trace_decay * self.discount_factor
+                eligbility_trace.mul_(eligibility_scaler).add_(grad)
+                if momentum != 0:
+                    buf = self.state[p].get("momentum_buffer", None)
+        
+                    if buf is None:
+                        buf = ((td_error * eligbility_trace)**2).clone().detach()
                     else:
-                        eligbility_traces.append(self.state[p].get("eligibility_trace",
-                                                                   torch.zeros_like(p)))
-                    momentum_buffer_list.append(self.state[p].get("momentum_buffer", None))
+                        buf.mul_(momentum).add_((td_error * eligbility_trace)**2,
+                                                alpha = 1 - momentum)
+                        sqrt_momentum = torch.sqrt(buf + 1e-8)
+                else:
+                    sqrt_momentum = 1
 
-            _obgd(
-                params,
-                eligbility_traces,
-                grads,
-                td_error,
-                momentum_buffer_list,
-                grad_scale=getattr(self, "grad_scale", None),
-                found_inf=getattr(self, "found_inf", None),
-                momentum = group["momentum"],
-                lr=group["lr"],
-                scaling_factor = self.scaling_factor,
-                discount_factor = self.discount_factor,
-                eligibility_trace_decay = self.eligibility_trace_decay,
-                maximize=group["maximize"],
-            )
+                et_sum += (eligbility_trace /sqrt_momentum).abs().sum()
+        return et_sum
 
-            for i, p in enumerate(group["params"]):
-                self.state[p]["eligibility_trace"] = eligbility_traces[i]
-                self.state[p]["momentum_buffer"] = momentum_buffer_list[i]
-    
+
+    # mostly following official PyTorch SGD implementation
+    def step(self, td_error, reset_eligibility = False):
+        grad_scale = getattr(self, "grad_scale", None)
+        found_inf = getattr(self, "found_inf", None)
+        assert grad_scale is None and found_inf is None
+        with torch.no_grad():
+            et_sum = self._update_et_momentum(self.defaults["momentum"], td_error)
+            for group in self.param_groups:
+                lr = group["lr"]
+                momentum = group["momentum"]
+                for i, p in enumerate(group["params"]):
+                    if p.grad is None:
+                        continue
+                    eligbility_trace = self.state[p].get("eligibility_trace",
+                                                         torch.zeros_like(p))
+                    if momentum != 0:
+                        buf = self.state[p]["momentum_buffer"]
+                        sqrt_momentum = torch.sqrt(buf + 1e-8)
+                    else:
+                        sqrt_momentum = 1
+
+                    et_scaled = eligbility_trace / sqrt_momentum
+
+                    scaled_error = torch.maximum(td_error.abs(), torch.tensor(1)).mean()
+                    #TODO : might not be sum here - maybe keep batch
+                    momentum_scale = self.scaling_factor * scaled_error * et_sum
+                    lr_ = min(lr, lr / (momentum_scale.item() + 1))
+
+                    p.data.add_(et_scaled, alpha=lr_ * td_error.mean().item())
+                    if reset_eligibility:
+                        self.state[p]["eligibility_trace"] = torch.zeros_like(p)
+
 def create_atari_env(video_dir, episode, name = "AssaultNoFrameskip-v4"):
     env = gym.make(name, render_mode="rgb_array")
     env = AtariPreprocessing(env, scale_obs=False, grayscale_obs=True, frame_skip=1)
@@ -361,20 +330,24 @@ def stream_q(env,
         inputs = network.encoder(state_tensor)
 
         state_action_values = network(inputs)
+        default_action = torch.argmax(state_action_values).item()
         greedy = np.random.random() < epsilon
         if greedy:
             action = torch.randint(0, state_action_values.shape[-1], (1,)).item()
+            if action == default_action:
+                greedy = False
         else:
-            action = torch.argmax(state_action_values).item()
+            action = default_action
 
         reward = 0
         for _ in range(steps_per_step):
             next_state, reward_i, done, truncated, _ = env.step(action)
             reward += reward_i
+            terminal = 1 if done or truncated else 0
+            if terminal:
+                break
 
         with torch.no_grad():
-            terminal = 1 if done or truncated else 0
-
             next_state_tensor = preprocess_state(next_state)
             next_inputs = network.encoder(next_state_tensor)
             next_state_action_values = network(next_inputs) * (1 - terminal)
@@ -383,10 +356,10 @@ def stream_q(env,
             delta = reward_normalized + gamma * torch.max(next_state_action_values, dim=-1).values
             delta -= state_action_values[:, action]
 
-        loss = state_action_values.sum()
+        loss = state_action_values[:, action].sum()
 
         loss.backward()
-        optimizer.step(delta, reset_eligibility = (not greedy))
+        optimizer.step(delta, reset_eligibility = (terminal or not greedy))
 
         state = next_state
         total_reward += reward
@@ -404,7 +377,7 @@ def train(network,
           video_dir = "tmp/",
           epsilon_start=1.0,
           epsilon_final=0.01,
-          epsilon_decay=0.99,):
+          epsilon_decay=0.9,):
     os.makedirs(video_dir, exist_ok=True)
     epsilon = epsilon_start
     rewards = []
@@ -493,7 +466,7 @@ if __name__ == "__main__":
     q_dims = [16, 32]
     env_name = "CartPole-v1"
     encoder_type = "classic"
-    num_episodes = 100
+    num_episodes = 500
     env = create_env("tmp/", 0, env_name)
     action_num = env.action_space.n
 
