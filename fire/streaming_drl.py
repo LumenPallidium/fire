@@ -3,53 +3,16 @@ import torch
 from torch.optim import Optimizer
 from typing import List, Optional
 from torch import Tensor
-import math
-import gymnasium as gym
+import gym
+import ale_py
 from tqdm import tqdm
 import numpy as np
-from gymnasium.wrappers import AtariPreprocessing, FrameStack
-from gymnasium.wrappers.record_video import RecordVideo
+from gym.wrappers import AtariPreprocessing
+from gym.wrappers.frame_stack import FrameStack
+from gym.wrappers.record_video import RecordVideo
+from copy import deepcopy
 
-class ConvEncoder(torch.nn.Module):
-    def __init__(self, input_channels):
-        super(ConvEncoder, self).__init__()
-        self.conv1 = torch.nn.Conv2d(input_channels, 32, kernel_size=8, stride=4)
-        self.conv2 = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1)
-
-    def forward(self, x):
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = torch.relu(self.conv3(x))
-        return x.view(x.size(0), -1)
-
-def entropy(probs):
-    return -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
-
-def custom_sparse_init(tensor, sparsity = 0.1):
-    with torch.no_grad():
-        fan_in = tensor.size(1)
-        scale = 1 / fan_in
-        tensor.data.uniform_(-1, 1).mul_(scale)
-        mask = torch.rand_like(tensor) > sparsity
-        tensor.data *= mask
-        tensor.data /= math.sqrt(fan_in)
-
-class SparseLinear(torch.nn.Module):
-    def __init__(self, in_features, out_features, sparsity = 0.9):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features))
-        self.bias = torch.nn.Parameter(torch.empty(out_features))
-        self.reset_parameters(sparsity)
-
-    def reset_parameters(self, sparsity):
-        custom_sparse_init(self.weight, sparsity)
-        self.bias.data.zero_()
-
-    def forward(self, x):
-        return torch.nn.functional.linear(x, self.weight, self.bias)
+from utils import NormedSparseMLP, ConvEncoder, entropy
 
 def _running_mean_var(x, mean, p, n, add_batch = True):
     """
@@ -110,7 +73,7 @@ class ObGD(Optimizer):
     def __init__(self,
                  params,
                  lr=1,
-                 momentum=0,
+                 momentum=0.2,
                  maximize=False,
                  scaling_factor = 2,
                  discount_factor = 0.99,
@@ -148,7 +111,10 @@ class ObGD(Optimizer):
                     continue
                 grad = p.grad if group["maximize"] else -p.grad
                 eligbility_trace = self.state[p].get("eligibility_trace",
-                                                        torch.zeros_like(p))
+                                                     None)
+                if eligbility_trace is None:
+                    eligbility_trace = torch.zeros_like(p)
+                    self.state[p]["eligibility_trace"] = eligbility_trace
                 eligibility_scaler = self.eligibility_trace_decay * self.discount_factor
                 eligbility_trace.mul_(eligibility_scaler).add_(grad)
                 if momentum != 0:
@@ -156,14 +122,15 @@ class ObGD(Optimizer):
         
                     if buf is None:
                         buf = ((td_error * eligbility_trace)**2).clone().detach()
+                        self.state[p]["momentum_buffer"] = buf
                     else:
                         buf.mul_(momentum).add_((td_error * eligbility_trace)**2,
                                                 alpha = 1 - momentum)
-                        sqrt_momentum = torch.sqrt(buf + 1e-8)
+                    sqrt_momentum = torch.sqrt(buf + 1e-8)
                 else:
                     sqrt_momentum = 1
 
-                et_sum += (eligbility_trace /sqrt_momentum).abs().sum()
+                et_sum += (eligbility_trace / sqrt_momentum).abs().sum()
         return et_sum
 
 
@@ -199,15 +166,15 @@ class ObGD(Optimizer):
                     if reset_eligibility:
                         self.state[p]["eligibility_trace"] = torch.zeros_like(p)
 
-def create_atari_env(video_dir, episode, name = "AssaultNoFrameskip-v4"):
+def create_atari_env(video_dir, episode, name = "ALE/AssaultNoFrameskip-v4"):
     env = gym.make(name, render_mode="rgb_array")
     env = AtariPreprocessing(env, scale_obs=False, grayscale_obs=True, frame_skip=1)
     env = FrameStack(env, 4)
     env = RecordVideo(env,
                       video_folder=video_dir,
                       episode_trigger=lambda x: True,
-                      name_prefix=f"episode_{episode}",
-                      disable_logger=True)
+                      fps=30,
+                      name_prefix=f"episode_{episode}")
     return env
 
 def create_classic_env(video_dir, episode, name = "CartPole-v1"):
@@ -215,8 +182,8 @@ def create_classic_env(video_dir, episode, name = "CartPole-v1"):
     env = RecordVideo(env,
                       video_folder=video_dir,
                       episode_trigger=lambda x: True,
-                      name_prefix=f"episode_{episode}",
-                      disable_logger=True)
+                      fps=30,
+                      name_prefix=f"episode_{episode}")
     return env
 
 def create_env(video_dir, episode, name):
@@ -242,11 +209,11 @@ def stream_ac(env,
     truncated = False
     total_reward = 0
 
-    optimizer_a = ObGD(list(network.actor.parameters()) + list(network.encoder.parameters()),
+    optimizer_a = ObGD(network.actor.parameters(),
                        lr=lr,
                        maximize=True,
                        **optimizer_kwargs)
-    optimizer_c = ObGD(list(network.critic.parameters()),
+    optimizer_c = ObGD(network.critic.parameters(),
                        lr=lr,
                        maximize=True,
                        **optimizer_kwargs)
@@ -259,12 +226,10 @@ def stream_ac(env,
 
         state_tensor = preprocess_state(state).requires_grad_()
     
-        inputs = network.encoder(state_tensor)
-
-        state_value = network.critic(inputs.detach().clone().requires_grad_())
+        state_value = network.critic(state_tensor.detach().clone().requires_grad_())
         # only letting encoder grad go through actor
-        q_values = network.act(inputs)
-        action = torch.multinomial(q_values, 1)
+        q_values = network.act(state_tensor)
+        action = torch.multinomial(q_values, 1).item()
 
         reward = 0
         for _ in range(steps_per_step):
@@ -273,13 +238,12 @@ def stream_ac(env,
 
         terminal = 1 if done or truncated else 0
         next_state_tensor = preprocess_state(next_state)
-        next_inputs = network.encoder(next_state_tensor)
 
-        reward_normalized = network.reward_scaler(reward, terminal)
         with torch.no_grad():
-            delta = reward_normalized + (1 - terminal) * gamma * network.critic(next_inputs)
+            reward_normalized = network.reward_scaler(reward, terminal)
+            delta = reward_normalized + (1 - terminal) * gamma * network.critic(next_state_tensor)
             delta -= state_value
-        delta_sgn = torch.sign(delta).detach()
+            delta_sgn = torch.sign(delta).detach()
         
         # note since we are using eligibility traces in optimizer,
         # loss grad is combined with delta later
@@ -291,13 +255,13 @@ def stream_ac(env,
         loss_a.backward()
         loss_c.backward()
 
-        optimizer_a.step(delta)
-        optimizer_c.step(delta)
+        optimizer_c.step(delta.mean(), reset_eligibility = terminal)
+        optimizer_a.step(delta.mean(), reset_eligibility = terminal)
         
         state = next_state
         total_reward += reward
         counter += steps_per_step
-        pbar.set_description(f"Ep:{pbar.n} |S:{counter} |TD:{delta.mean().item():.2f} |R:{total_reward:.2f}")
+        pbar.set_description(f"Ep:{pbar.n} |S:{counter} |R:{total_reward:.2f}")
 
     pbar.update(1)
 
@@ -316,7 +280,7 @@ def stream_q(env,
     truncated = False
     total_reward = 0
 
-    optimizer = ObGD(list(network.q.parameters()),
+    optimizer = ObGD(list(network.parameters()),
                      lr=lr,
                      maximize=True,
                      **optimizer_kwargs)
@@ -326,7 +290,6 @@ def stream_q(env,
         optimizer.zero_grad()
 
         state_tensor = preprocess_state(state).requires_grad_()
-    
         inputs = network.encoder(state_tensor)
 
         state_action_values = network(inputs)
@@ -359,12 +322,13 @@ def stream_q(env,
         loss = state_action_values[:, action].sum()
 
         loss.backward()
-        optimizer.step(delta, reset_eligibility = (terminal or not greedy))
+        optimizer.step(delta.mean(),
+                       reset_eligibility = (terminal or not greedy))
 
         state = next_state
         total_reward += reward
         counter += steps_per_step
-        pbar.set_description(f"Ep:{pbar.n} |S:{counter}\n|TD:{delta.mean().item():.2f} |R:{total_reward:.2f}\n|E:{epsilon:.2f}")
+        pbar.set_description(f"Ep:{pbar.n} |S:{counter} |R:{total_reward:.2f} |E:{epsilon:.2f}")
 
     pbar.update(1)
 
@@ -391,28 +355,6 @@ def train(network,
         rewards.append(total_reward)
     return rewards
 
-class NormedSparseMLP(torch.nn.Module):
-    def __init__(self,
-                 dims,
-                 sparsity = 0.9,
-                 activation = torch.nn.LeakyReLU()):
-        super().__init__()
-        self.in_dim = dims[0]
-        self.out_dim = dims[-1]
-        self.sparsity = sparsity
-
-        self.layers = []
-        for i in range(1, len(dims)):
-            self.layers.append(SparseLinear(dims[i-1], dims[i], sparsity))
-            self.layers.append(torch.nn.LayerNorm(dims[i], elementwise_affine = False))
-            self.layers.append(activation)
-
-        self.layers = torch.nn.ModuleList(self.layers)
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
 
 class ActorCritic(torch.nn.Module):
     def __init__(self,
@@ -423,13 +365,20 @@ class ActorCritic(torch.nn.Module):
                  critic_dims = [256, 128],):
         super().__init__()
         if encoder_type == "conv":
-            self.encoder = torch.nn.Sequential(
+            encoder_a = torch.nn.Sequential(
                 ConvEncoder(4),
                 ObsScaler(encoder_out_size))
+            encoder_c = deepcopy(encoder_a)
         else:
-            self.encoder = ObsScaler(encoder_out_size)
-        self.actor = NormedSparseMLP([encoder_out_size] + actor_dims + [action_dim])
-        self.critic = NormedSparseMLP([encoder_out_size] + critic_dims + [1])
+            encoder_a = ObsScaler(encoder_out_size)
+            encoder_c = deepcopy(encoder_a)
+        self.actor = torch.nn.Sequential(
+            encoder_a,
+            NormedSparseMLP([encoder_out_size] + actor_dims + [action_dim])
+        )
+        self.critic = torch.nn.Sequential(
+            encoder_c,
+            NormedSparseMLP([encoder_out_size] + critic_dims + [1]))
         self.reward_scaler = RewardScaler(0.99)
 
     def act(self, x):
@@ -460,34 +409,36 @@ class QNet(torch.nn.Module):
 
 if __name__ == "__main__":
     from matplotlib import pyplot as plt
-    # encoder_out_size = 64 * 7 * 7
-    # env_name = "AssaultNoFrameskip-v4"
-    encoder_out_size = 4
-    q_dims = [16, 32]
-    env_name = "CartPole-v1"
-    encoder_type = "classic"
-    num_episodes = 500
+    encoder_out_size = 64 * 7 * 7
+    env_name = "AssaultNoFrameskip-v4"
+    encoder_type = "conv"
+    q_dims = [256, 128]
+    # encoder_out_size = 4
+    # env_name = "CartPole-v1"
+    # encoder_type = "classic"
+    num_episodes = 100
     env = create_env("tmp/", 0, env_name)
     action_num = env.action_space.n
 
-    # net = ActorCritic(encoder_out_size, action_num, encoder_type)
+    net = ActorCritic(encoder_out_size, action_num, encoder_type,
+    actor_dims = q_dims, critic_dims = q_dims)
+
+    # do a dummy pass to initialize the network
+    with torch.no_grad():
+        state = preprocess_state(env.reset()[0])
+        net.act(state)
+        net.critic(state)
+
+    rewards = train(net, num_episodes, env_name, stream_ac)
+
+    # net = QNet(encoder_out_size, action_num, encoder_type, q_dims = q_dims)
 
     # # do a dummy pass to initialize the network
     # state = preprocess_state(env.reset()[0])
     # inputs = net.encoder(state)
-    # net.act(inputs)
-    # net.critic(inputs)
+    # net(inputs)
 
-    # rewards = train(net, num_episodes, env_name, stream_ac)
-
-    net = QNet(encoder_out_size, action_num, encoder_type, q_dims = q_dims)
-
-    # do a dummy pass to initialize the network
-    state = preprocess_state(env.reset()[0])
-    inputs = net.encoder(state)
-    net(inputs)
-
-    rewards = train(net, num_episodes, env_name, stream_q)
+    # rewards = train(net, num_episodes, env_name, stream_q)
 
     smooth_rewards = np.convolve(rewards, np.ones(10) / 10, mode="valid")
     plt.plot(smooth_rewards)
