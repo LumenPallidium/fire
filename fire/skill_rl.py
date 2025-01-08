@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from gymnasium import make
 from utils import ReplayBuffer, NormedSparseMLP
 from copy import deepcopy
@@ -46,12 +47,14 @@ class StateRepresenter(torch.nn.Module):
     def __init__(self,
                  obs_dim,
                  skill_dim,
-                 dims = [256, 128]):
+                 dims = [256, 128],
+                 sparsity = 0.2):
         super().__init__()
         self.obs_dim = obs_dim
         self.skill_dim = skill_dim
 
-        self.encoder = NormedSparseMLP([obs_dim] + dims + [skill_dim])
+        self.encoder = NormedSparseMLP([obs_dim] + dims + [skill_dim],
+                                       sparsity = sparsity)
 
     def forward(self, obs):
         return self.encoder(obs)
@@ -62,14 +65,16 @@ class SkillConditionedPolicy(torch.nn.Module):
                  skill_dim,
                  action_dim,
                  discrete = False,
-                 dims = [256, 128]):
+                 dims = [256, 128],
+                 sparsity = 0.2):
         super().__init__()
         self.obs_dim = obs_dim
         self.skill_dim = skill_dim
         self.action_dim = action_dim
         self.discrete = discrete
 
-        self.actor = NormedSparseMLP([obs_dim + skill_dim] + dims + [action_dim])
+        self.actor = NormedSparseMLP([obs_dim + skill_dim] + dims + [action_dim],
+                                     sparsity = sparsity)
         self.softmax = torch.nn.Softmax(dim = -1)
 
     def forward(self, obs, skill):
@@ -84,12 +89,14 @@ class SuccessorEncoder(torch.nn.Module):
                  obs_dim,
                  action_dim,
                  skill_dim,
-                 dims = [256, 128]):
+                 dims = [256, 128],
+                 sparsity = 0.2):
         super().__init__()
         self.obs_dim = obs_dim
         self.skill_dim = skill_dim
 
-        self.encoder = NormedSparseMLP([obs_dim + action_dim + skill_dim] + dims + [skill_dim])
+        self.encoder = NormedSparseMLP([obs_dim + action_dim + skill_dim] + dims + [skill_dim],
+                                       sparsity = sparsity)
 
     def forward(self, obs, action_onehot, skill):
         x = torch.cat([obs, action_onehot, skill], dim = -1)
@@ -99,12 +106,15 @@ class SuccessorEncoder(torch.nn.Module):
         for p, q in zip(self.parameters(), other.parameters()):
             p.data = alpha * p.data + (1 - alpha) * q.data
 
+
 def main(n_epochs = 100,
          steps_per_epoch = 512,
          batch_size = 256,
-         n_counterfactual_skills = 256,
+         buffer_capacity = int(1e4),
+         episodes_per_epoch = 4,
          gamma = 0.99,
-         skill_dim = 128):
+         skill_dim = 2,
+         traj_snapshot_every = 10):
     env = make("Ant-v5")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     obs_dim = env.observation_space.shape[0]
@@ -124,30 +134,38 @@ def main(n_epochs = 100,
     buffer = ReplayBuffer(obs_dim,
                           action_dim,
                           special_buffer_dim = skill_dim,
-                          capacity = steps_per_epoch * batch_size)
+                          capacity = buffer_capacity)
     
     pbar = tqdm(range(n_epochs * steps_per_epoch))
     losses = []
 
+    xy_trajs = []
+
     for epoch in range(n_epochs):
-        # fill buffer
-        obs, _ = env.reset()
-        for buffer_step in range(buffer.capacity):
+        counter = 0
+        for ep in range(episodes_per_epoch):
+            done = False
+            # fill buffer
+            obs, _ = env.reset()
             skill = skill_space.sample().to(device)
-            action = policy(torch.tensor(obs,
-                                         device = device,
-                                         dtype = torch.float32),
-                                  skill)
-            next_obs, reward, terminated, truncated, _ = env.step(action.detach().cpu().numpy())
-            done = terminated or truncated
+            ep_traj = []
+            while not done:
+                action = policy(torch.tensor(obs,
+                                            device = device,
+                                            dtype = torch.float32),
+                                skill)
+                next_obs, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
+                done = terminated or truncated
 
-            buffer.push(obs, action, next_obs, done, reward = reward, special = skill)
-            obs = next_obs
-            if done:
-                obs, _ = env.reset()
-            pbar.set_description(f"Filling buffer {buffer_step}/{buffer.capacity}")
+                buffer.push(obs, action, next_obs, done, reward = reward, special = skill)
+                obs = next_obs
+                counter += 1
+                pbar.set_description(f"Filling buffer {counter}/{buffer.capacity}")
+                ep_traj.append([info["x_position"], info["y_position"]])
+            # record all episodes for given epoch
+            if epoch % traj_snapshot_every == 0:
+                xy_trajs.append(ep_traj)
             
-
         for _ in range(steps_per_epoch):
             optimizer_encoder.zero_grad()
             optimizer_successor.zero_grad()
@@ -155,31 +173,35 @@ def main(n_epochs = 100,
 
             states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size,
                                                                                  device = device)
+            dummy_actions = policy(states, skills)
+            # replace with previous actions to get grad
+            dummy_actions.data = actions.data
             
-            # new skills and actions
-            counterfactual_skills = skill_space.sample(n_samples = n_counterfactual_skills)
-            counterfactual_skills = counterfactual_skills.repeat(batch_size, 1, 1).to(device)
-            new_actions = policy(states, skills)
-
             state_reps = state_representer(states)
+            #TODO : paper doesn't say to stop the gradient, but it makes sense
             next_state_reps = state_representer(next_states)
-            successors = successor_encoder(states, actions, skills)
-            successors_emas = successor_encoder_ema(next_states,
-                                                    new_actions,
-                                                    skills)
+            successors = successor_encoder(states, dummy_actions, skills)
 
             state_diffs = next_state_reps - state_reps
+            counterfactual_skills = skill_space.sample(n_samples = batch_size).to(device)
 
-            encoder_loss = -torch.einsum("bi,bi->b",
-                                         state_diffs,
-                                         skills).mean()
-            nce_term = torch.einsum("bi,bmi->bm",
+            encoder_loss = -(state_diffs * skills).sum(dim=-1).mean()
+            nce_term = torch.einsum("bi,mi->bm",
                                     state_diffs,
                                     counterfactual_skills)
-            nce_term = torch.logsumexp(nce_term, dim = 1)
+            # skill_match = (skills[None, :] == skills[:, None]).all(dim = -1)
+            # set where they match to -inf i.e. remove them
+            # nce_term[skill_match] = -np.inf
+            nce_term = torch.exp(nce_term).mean(dim = -1).log()
             encoder_loss += nce_term.mean()
 
-            successor_td = state_diffs + gamma * successors_emas
+            with torch.no_grad():
+                # new actions
+                new_actions = policy(next_states, skills)
+                successors_emas = successor_encoder_ema(next_states,
+                                                        new_actions,
+                                                        skills)
+                successor_td = state_diffs + gamma * successors_emas
 
             successor_loss = torch.nn.functional.mse_loss(successors,
                                                           successor_td.detach())
@@ -196,20 +218,30 @@ def main(n_epochs = 100,
             optimizer_policy.step()
 
             successor_encoder_ema.ema(successor_encoder)
-            losses.append((encoder_loss.item(),
+            losses.append([encoder_loss.item(),
                            successor_loss.item(),
-                           policy_loss.item()))
+                           policy_loss.item()])
 
             pbar.update(1)
-            pbar.set_description(f"Epoch {epoch} | Loss {encoder_loss.item() + successor_loss.item() + policy_loss.item():.2f}")
-    return losses
+            pbar.set_description(f"Epoch {epoch} | Loss {encoder_loss.item():.2e} | {successor_loss.item():.2e} | {policy_loss.item():.2e}")
+    return np.array(losses), np.array(xy_trajs)
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
-    losses = main(n_epochs = 100,
-                  steps_per_epoch = 8,
+    losses, trajs = main(n_epochs = 1000,
+                  steps_per_epoch = 200,
+                  buffer_capacity = int(1e6),
                   batch_size = 256)
 
-    fig, ax = plt.subplots(1, 1, figsize = (12, 6))
-    ax.plot(losses)
+    fig, ax = plt.subplots(1, 2, figsize = (12, 6))
+    for i, label in enumerate(["Encoder", "Successor", "Policy"]):
+        smooth_losses = np.convolve(losses[:, i], np.ones(100) / 100, mode = "valid")
+        smooth_losses /= smooth_losses.max() - smooth_losses.min()
+        ax[0].plot(smooth_losses, label = label)
+    ax[0].legend()
+
+    for i in range(trajs.shape[0]):
+        traj = trajs[i, :, :]
+        alpha = (i / trajs.shape[0])
+        ax[1].plot(traj[:, 0], traj[:, 1], alpha = alpha)

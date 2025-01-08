@@ -10,8 +10,13 @@ class ReplayBuffer:
                  state_dim,
                  action_dim,
                  special_buffer_dim = None,
-                 capacity = 256 * 512):
+                 capacity = int(1e4),
+                 min_capacity = 0.1):
         self.capacity = capacity
+        if min_capacity < 1:
+            min_capacity = int(capacity * min_capacity)
+        self.min_capacity = min_capacity
+
         self.state_buffer = np.zeros((capacity, state_dim), dtype = np.float32)
         self.action_buffer = np.zeros((capacity, action_dim), dtype = np.float32)
         self.reward_buffer = np.zeros((capacity, 1), dtype = np.float32)
@@ -45,8 +50,10 @@ class ReplayBuffer:
     def sample(self, batch_size = 256, device = None):
         if self.total < batch_size:
             batch_size = self.total
-
-        idx = torch.randint(0, self.capacity, (batch_size,))
+        if self.total < self.capacity:
+            idx = np.random.randint(0, self.total, batch_size)
+        else:
+            idx = np.random.randint(0, self.capacity, batch_size)
         return (torch.tensor(self.state_buffer[idx], device = device),
                 torch.tensor(self.action_buffer[idx], device = device),
                 torch.tensor(self.reward_buffer[idx], device = device),
