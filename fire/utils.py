@@ -85,11 +85,10 @@ def entropy(probs):
 def custom_sparse_init(tensor, sparsity = 0.1):
     with torch.no_grad():
         fan_in = tensor.size(1)
-        scale = 1 / fan_in
+        scale = 1 / math.sqrt(fan_in)
         tensor.data.uniform_(-1, 1).mul_(scale)
         mask = torch.rand_like(tensor) > sparsity
         tensor.data *= mask
-        tensor.data /= math.sqrt(fan_in)
 
 class SparseLinear(torch.nn.Module):
     def __init__(self, in_features, out_features, sparsity = 0.9):
@@ -121,7 +120,8 @@ class NormedSparseMLP(torch.nn.Module):
         for i in range(1, len(dims)):
             self.layers.append(SparseLinear(dims[i-1], dims[i], sparsity))
             self.layers.append(torch.nn.LayerNorm(dims[i], elementwise_affine = False))
-            self.layers.append(activation)
+            if i < len(dims) - 1:
+                self.layers.append(activation)
 
         self.layers = torch.nn.ModuleList(self.layers)
 

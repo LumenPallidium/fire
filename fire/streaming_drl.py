@@ -26,7 +26,7 @@ def _running_mean_var(x, mean, p, n, add_batch = True):
     #TODO : could make this a matrix and get covariance
     p += ((x - mean) * (x - mean_bar)).mean(dim = 0)
     var = p / (n-1) if n > 1 else torch.tensor(1)
-    return mean_bar, var, n
+    return mean_bar, var, p, n
 
 class RewardScaler(torch.nn.Module):
     def __init__(self, decay):
@@ -43,7 +43,7 @@ class RewardScaler(torch.nn.Module):
         """
         with torch.no_grad():
             u = reward + self.decay * (1 - terminal) * self.u
-            _, var, self.n = _running_mean_var(u, 0, self.p, self.n, add_batch = False)
+            _, var, self.p, self.n = _running_mean_var(u, 0, self.p, self.n, add_batch = False)
             self.u = u
         return reward / torch.sqrt(var + 1e-8)
     
@@ -59,7 +59,7 @@ class ObsScaler(torch.nn.Module):
         obs_shape = obs.shape
         obs = obs.view(obs_shape[0], -1)
         with torch.no_grad():
-            mean, var, n = _running_mean_var(obs, self.mean, self.p, self.n)
+            mean, var, self.p, n = _running_mean_var(obs, self.mean, self.p, self.n)
         if update:
             self.mean = mean
             self.var = var
@@ -173,7 +173,6 @@ def create_atari_env(video_dir, episode, name = "ALE/AssaultNoFrameskip-v4"):
     env = RecordVideo(env,
                       video_folder=video_dir,
                       episode_trigger=lambda x: True,
-                      fps=30,
                       name_prefix=f"episode_{episode}")
     return env
 
@@ -182,7 +181,6 @@ def create_classic_env(video_dir, episode, name = "CartPole-v1"):
     env = RecordVideo(env,
                       video_folder=video_dir,
                       episode_trigger=lambda x: True,
-                      fps=30,
                       name_prefix=f"episode_{episode}")
     return env
 
@@ -341,7 +339,8 @@ def train(network,
           video_dir = "tmp/",
           epsilon_start=1.0,
           epsilon_final=0.01,
-          epsilon_decay=0.9,):
+          epsilon_decay=0.9,
+          **episode_fn_kwargs):
     os.makedirs(video_dir, exist_ok=True)
     epsilon = epsilon_start
     rewards = []
@@ -349,7 +348,9 @@ def train(network,
     counter = 0
     for episode in range(num_episodes):
         env = create_env(video_dir, episode, env_name)
-        total_reward, counter = episode_function(env, network, epsilon, pbar, counter)
+        total_reward, counter = episode_function(env, network, epsilon,
+                                                 pbar, counter,
+                                                 **episode_fn_kwargs)
         epsilon = max(epsilon_final, epsilon * epsilon_decay)
         env.close()
         rewards.append(total_reward)
@@ -413,10 +414,12 @@ if __name__ == "__main__":
     env_name = "AssaultNoFrameskip-v4"
     encoder_type = "conv"
     q_dims = [256, 128]
+    steps_per_step = 4
     # encoder_out_size = 4
     # env_name = "CartPole-v1"
     # encoder_type = "classic"
-    num_episodes = 100
+    # steps_per_step = 1
+    num_episodes = 50
     env = create_env("tmp/", 0, env_name)
     action_num = env.action_space.n
 
@@ -429,7 +432,8 @@ if __name__ == "__main__":
         net.act(state)
         net.critic(state)
 
-    rewards = train(net, num_episodes, env_name, stream_ac)
+    rewards = train(net, num_episodes, env_name, stream_ac,
+                    steps_per_step = steps_per_step)
 
     # net = QNet(encoder_out_size, action_num, encoder_type, q_dims = q_dims)
 

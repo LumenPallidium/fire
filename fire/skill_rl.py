@@ -114,7 +114,8 @@ def main(n_epochs = 100,
          episodes_per_epoch = 4,
          gamma = 0.99,
          skill_dim = 2,
-         traj_snapshot_every = 10):
+         traj_snapshot_every = 10,
+         save_model_every = 50):
     env = make("Ant-v5")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     obs_dim = env.observation_space.shape[0]
@@ -205,9 +206,7 @@ def main(n_epochs = 100,
 
             successor_loss = torch.nn.functional.mse_loss(successors,
                                                           successor_td.detach())
-            policy_loss = -torch.einsum("bi,bi->b",
-                                        successors,
-                                        skills).mean()
+            policy_loss = -(successors * skills).sum(dim=-1).mean()
             
             encoder_loss.backward()
             successor_loss.backward(retain_graph = True)
@@ -223,25 +222,52 @@ def main(n_epochs = 100,
                            policy_loss.item()])
 
             pbar.update(1)
-            pbar.set_description(f"Epoch {epoch} | Loss {encoder_loss.item():.2e} | {successor_loss.item():.2e} | {policy_loss.item():.2e}")
+            pbar.set_description(f"Epoch {epoch} | Loss {encoder_loss.item():.2f} | {successor_loss.item():.2f} | {policy_loss.item():.2f}")
+        if epoch % save_model_every == 0:
+            # save models
+            torch.save(state_representer.state_dict(),
+                    f"tmp/state_representer_{epoch}.pt")
+            torch.save(policy.state_dict(),
+                    f"tmp/policy_{epoch}.pt")
+            torch.save(successor_encoder.state_dict(),
+                    f"tmp/successor_encoder_{epoch}.pt")
     return np.array(losses), np.array(xy_trajs)
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
+    import os
+    os.makedirs("tmp", exist_ok = True)
+    n_epochs = 300
+    episodes_per_epoch = 8
+    traj_snapshot_every = n_epochs // 10
+    smoothing_num = max(1, int(n_epochs / 10))
+    smooth_kernel = np.ones(smoothing_num) / smoothing_num
 
-    losses, trajs = main(n_epochs = 1000,
-                  steps_per_epoch = 200,
-                  buffer_capacity = int(1e6),
-                  batch_size = 256)
+    losses, trajs = main(n_epochs = n_epochs,
+                         steps_per_epoch = 200,
+                         buffer_capacity = int(1e6),
+                         episodes_per_epoch = episodes_per_epoch,
+                         traj_snapshot_every = traj_snapshot_every,
+                         batch_size = 256)
 
-    fig, ax = plt.subplots(1, 2, figsize = (12, 6))
+    fig, ax = plt.subplots(1, 3, figsize = (12, 6))
+    # plot the losses
     for i, label in enumerate(["Encoder", "Successor", "Policy"]):
-        smooth_losses = np.convolve(losses[:, i], np.ones(100) / 100, mode = "valid")
+        smooth_losses = np.convolve(losses[:, i],
+                                    smooth_kernel,
+                                    mode = "valid")
         smooth_losses /= smooth_losses.max() - smooth_losses.min()
         ax[0].plot(smooth_losses, label = label)
     ax[0].legend()
 
+    # plots some of the trajectories
     for i in range(trajs.shape[0]):
         traj = trajs[i, :, :]
         alpha = (i / trajs.shape[0])
         ax[1].plot(traj[:, 0], traj[:, 1], alpha = alpha)
+
+    # lastly get mean distance travelled over time
+    dists = np.linalg.norm(trajs[:, 0, :] - trajs[:, -1, :], axis = -1)
+    ax[2].plot(dists)
+
+    fig.savefig("tmp/skill_results.png", dpi = 300)
