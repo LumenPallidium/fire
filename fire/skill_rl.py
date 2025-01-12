@@ -65,6 +65,7 @@ class SkillConditionedPolicy(torch.nn.Module):
                  skill_dim,
                  action_dim,
                  discrete = False,
+                 variance = False,
                  dims = [256, 128],
                  sparsity = 0.2):
         super().__init__()
@@ -72,17 +73,36 @@ class SkillConditionedPolicy(torch.nn.Module):
         self.skill_dim = skill_dim
         self.action_dim = action_dim
         self.discrete = discrete
+        self.variance = variance
 
-        self.actor = NormedSparseMLP([obs_dim + skill_dim] + dims + [action_dim],
-                                     sparsity = sparsity)
+        self.actor_embed = NormedSparseMLP([obs_dim + skill_dim] + dims,
+                                           sparsity = sparsity)
+        self.actor = torch.nn.Linear(dims[-1], action_dim)
+        if self.variance:
+            self.logstd = torch.nn.Linear(dims[-1], action_dim)
+
         self.softmax = torch.nn.Softmax(dim = -1)
 
     def forward(self, obs, skill):
         # paper doesn't say how both inputs layout, assume concat
         x = torch.cat([obs, skill], dim = -1)
+        x = self.actor_embed(x)
         if self.discrete:
             return self.softmax(self.actor(x))
+        elif self.variance:
+            return self.actor(x), self.logstd(x)
         return self.actor(x)
+    
+    def stochastic_sample(self, obs, skill,
+                          min_scale = None, max_scale = None):
+        assert self.variance
+        mu, logstd = self.forward(obs, skill)
+        std = torch.exp(logstd)
+
+        normal = torch.distributions.Normal(mu, std)
+        eps = normal.sample()
+        log_prob = normal.log_prob(eps).sum(dim = -1)
+        return mu + std * eps, log_prob
     
 class SuccessorEncoder(torch.nn.Module):
     def __init__(self,
@@ -161,6 +181,7 @@ def main(n_epochs = 100,
                 buffer.push(obs, action, next_obs, done, reward = reward, special = skill)
                 obs = next_obs
                 counter += 1
+                pbar.update(0)
                 pbar.set_description(f"Filling buffer {counter}/{buffer.capacity}")
                 ep_traj.append([info["x_position"], info["y_position"]])
             # record all episodes for given epoch
@@ -174,14 +195,15 @@ def main(n_epochs = 100,
 
             states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size,
                                                                                  device = device)
-            dummy_actions = policy(states, skills)
-            # replace with previous actions to get grad
-            dummy_actions.data = actions.data
+            
+            # new actions
+            new_actions = policy(states, skills)
+            new_next_actions = policy(next_states, skills)
             
             state_reps = state_representer(states)
             #TODO : paper doesn't say to stop the gradient, but it makes sense
             next_state_reps = state_representer(next_states)
-            successors = successor_encoder(states, dummy_actions, skills)
+            successors = successor_encoder(states, new_actions, skills)
 
             state_diffs = next_state_reps - state_reps
             counterfactual_skills = skill_space.sample(n_samples = batch_size).to(device)
@@ -197,10 +219,8 @@ def main(n_epochs = 100,
             encoder_loss += nce_term.mean()
 
             with torch.no_grad():
-                # new actions
-                new_actions = policy(next_states, skills)
                 successors_emas = successor_encoder_ema(next_states,
-                                                        new_actions,
+                                                        new_next_actions,
                                                         skills)
                 successor_td = state_diffs + gamma * successors_emas
 
@@ -231,7 +251,7 @@ def main(n_epochs = 100,
                     f"tmp/policy_{epoch}.pt")
             torch.save(successor_encoder.state_dict(),
                     f"tmp/successor_encoder_{epoch}.pt")
-    return np.array(losses), np.array(xy_trajs)
+    return np.array(losses), xy_trajs
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
@@ -244,7 +264,7 @@ if __name__ == "__main__":
     smooth_kernel = np.ones(smoothing_num) / smoothing_num
 
     losses, trajs = main(n_epochs = n_epochs,
-                         steps_per_epoch = 200,
+                         steps_per_epoch = 512,
                          buffer_capacity = int(1e6),
                          episodes_per_epoch = episodes_per_epoch,
                          traj_snapshot_every = traj_snapshot_every,
@@ -259,15 +279,16 @@ if __name__ == "__main__":
         smooth_losses /= smooth_losses.max() - smooth_losses.min()
         ax[0].plot(smooth_losses, label = label)
     ax[0].legend()
-
+    dists_time = []
     # plots some of the trajectories
-    for i in range(trajs.shape[0]):
-        traj = trajs[i, :, :]
-        alpha = (i / trajs.shape[0])
+    for i in range(len(trajs)):
+        traj = np.array(trajs[i])
+        alpha = (i / len(trajs))
         ax[1].plot(traj[:, 0], traj[:, 1], alpha = alpha)
 
-    # lastly get mean distance travelled over time
-    dists = np.linalg.norm(trajs[:, 0, :] - trajs[:, -1, :], axis = -1)
-    ax[2].plot(dists)
+        # lastly get mean distance travelled over time
+        dists = np.linalg.norm(traj[0, :] - traj[-1, :], axis = -1)
+        dists_time.append(dists)
+    ax[2].plot(dists_time)
 
     fig.savefig("tmp/skill_results.png", dpi = 300)
