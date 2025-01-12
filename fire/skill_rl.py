@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from gymnasium import make
-from utils import ReplayBuffer, NormedSparseMLP
+from utils import ReplayBuffer, NormedSparseMLP, SACWrapper
 from copy import deepcopy
 from tqdm import tqdm
 
@@ -132,10 +132,11 @@ def fill_buffer(env, policy, device, skill_space, buffer, pbar, counter):
     skill = skill_space.sample().to(device)
     ep_traj = []
     while not done:
-        action = policy(torch.tensor(obs,
+        action, action_std = policy(torch.tensor(obs,
                                     device = device,
                                     dtype = torch.float32),
                         skill)
+        action = action + action_std.exp() * torch.randn_like(action)
         next_obs, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
         done = terminated or truncated
 
@@ -164,7 +165,11 @@ def main(n_epochs = 100,
 
     skill_space = ContinuousSkillSpace(skill_dim).to(device)
     state_representer = StateRepresenter(obs_dim, skill_dim).to(device)
-    policy = SkillConditionedPolicy(obs_dim, skill_dim, action_dim).to(device)
+    policy = SkillConditionedPolicy(obs_dim, skill_dim, action_dim,
+                                    variance = True).to(device)
+    sac_model = SACWrapper(obs_dim, action_dim,
+                           #TODO : don't hardcode reward dim
+                           reward_dim = 256).to(device)
     successor_encoder = SuccessorEncoder(obs_dim, action_dim, skill_dim).to(device)
     successor_encoder_ema = deepcopy(successor_encoder)
     successor_encoder_ema.requires_grad_(False)
@@ -202,8 +207,11 @@ def main(n_epochs = 100,
                                                                                  device = device)
             
             # new actions
-            new_actions = policy(states, skills)
-            new_next_actions = policy(next_states, skills)
+            new_actions, new_actions_std = policy(states, skills)
+            new_next_actions, next_actions_std = policy(next_states, skills)
+
+            new_actions = new_actions + new_actions_std.exp() * torch.randn_like(new_actions)
+            new_next_actions = new_next_actions + next_actions_std.exp() * torch.randn_like(new_next_actions)
             
             state_reps = state_representer(states)
             next_state_reps = state_representer(next_states)
@@ -227,7 +235,10 @@ def main(n_epochs = 100,
 
             successor_loss = torch.nn.functional.mse_loss(successors,
                                                           successor_td.detach())
-            policy_loss = -(successors * skills).sum(dim=-1).mean()
+            policy_reward = -(successors * skills).sum(dim=-1).mean()
+            policy_loss, _ = sac_model([states, actions, rewards, next_states, dones, skills],
+                                       policy,
+                                       reward = policy_reward)
             
             encoder_loss.backward()
             successor_loss.backward(retain_graph = True)
@@ -235,6 +246,7 @@ def main(n_epochs = 100,
 
             optimizer_encoder.step()
             optimizer_successor.step()
+            sac_model.step()
             optimizer_policy.step()
 
             successor_encoder_ema.ema(successor_encoder)
@@ -252,13 +264,15 @@ def main(n_epochs = 100,
                     f"tmp/policy_{epoch}.pt")
             torch.save(successor_encoder.state_dict(),
                     f"tmp/successor_encoder_{epoch}.pt")
+            torch.save(sac_model.state_dict(),
+                       f"tmp/sac_model_{epoch}.pt")
     return np.array(losses), xy_trajs
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import os
     os.makedirs("tmp", exist_ok = True)
-    n_epochs = 300
+    n_epochs = 50
     episodes_per_epoch = 8
     traj_snapshot_every = n_epochs // 10
     smoothing_num = max(1, int(n_epochs / 10))

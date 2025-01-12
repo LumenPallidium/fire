@@ -1,6 +1,7 @@
 import torch
 import math
 import numpy as np
+from copy import deepcopy
 
 class ReplayBuffer:
     """
@@ -139,10 +140,13 @@ class DoubleQNetwork(torch.nn.Module):
                  state_dim,
                  action_dim,
                  hidden_dims = [256, 256],
+                 reward_dim = 1,
                  activation = torch.nn.LeakyReLU()):
         super(DoubleQNetwork, self).__init__()
-        self.q1 = NormedSparseMLP([state_dim + action_dim] + hidden_dims + [1])
-        self.q2 = NormedSparseMLP([state_dim + action_dim] + hidden_dims + [1])
+        self.q1 = NormedSparseMLP([state_dim + action_dim] + hidden_dims + [reward_dim],
+                                  activation=activation)
+        self.q2 = NormedSparseMLP([state_dim + action_dim] + hidden_dims + [reward_dim],
+                                  activation=activation)
 
     def forward(self, state, action):
         x = torch.cat([state, action], dim = -1)
@@ -152,22 +156,20 @@ class DoubleQNetwork(torch.nn.Module):
         for p, q in zip(self.parameters(), other.parameters()):
             p.data = alpha * p.data + (1 - alpha) * q.data
     
-def sac_step(buffer, policy, critics, targets,
-             gamma = 0.99, device = None,
-             batch_size = 256, alpha = 0.01,
+def sac_step(sample, policy, critics,
+             gamma = 0.99, alpha = 0.01,
              override_rewards = None):
     """
     A single step of Soft Actor Critic. Minimalist version based on CleanRL.
     """
-    states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size,
-                                                                         device = device)
+    states, actions, rewards, next_states, dones, skills = sample
 
     if override_rewards is not None:
-        rewards = override_rewards
+        rewards = override_rewards.detach()
 
     # get the q values
     with torch.no_grad():
-        next_action, next_log_pi = policy(next_states)
+        next_action, next_log_pi = policy.stochastic_sample(next_states, skills)
         target_q1, target_q2 = critics(next_states, next_action)
         target_q = torch.min(target_q1, target_q2)
         target_q = rewards + gamma * (1 - dones) * (target_q - alpha * next_log_pi)
@@ -176,13 +178,53 @@ def sac_step(buffer, policy, critics, targets,
     critic_loss = torch.nn.functional.mse_loss(q1, target_q) + torch.nn.functional.mse_loss(q2, target_q)
 
     # update policy
-    new_action, log_pi = policy(states)
+    new_action, log_pi = policy.stochastic_sample(states, skills)
     q1_new, q2_new = critics(states, new_action)
     q_new = torch.min(q1_new, q2_new)
 
     policy_loss = (alpha * log_pi - q_new).mean()
 
-    # update targets
-    targets.ema(critics)
-
     return critic_loss, policy_loss
+
+class SACWrapper(torch.nn.Module):
+    """
+    Convenience wrapper so we can do most SAC steps in a single call and
+    not worry about the critics and targers.
+    """
+    def __init__(self,
+                 state_dim,
+                 action_dim,
+                 critic_dims = [256, 256],
+                 reward_dim = 1,
+                 activation = torch.nn.LeakyReLU(),
+                 lr = 1e-4,
+                 gamma = 0.99,
+                 alpha = 0.995):
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.alpha = alpha
+
+        self.critics = DoubleQNetwork(state_dim, action_dim,
+                                      hidden_dims = critic_dims,
+                                      reward_dim = reward_dim,
+                                      activation = activation)
+        self.targets = deepcopy(self.critics).requires_grad_(False)
+        self.optimizer = torch.optim.Adam(self.critics.parameters(), lr = lr)
+
+    def forward(self, sample, policy, reward = None, train = True):
+        critic_loss, policy_loss = sac_step(sample, policy, self.critics,
+                                            override_rewards = reward,
+                                            gamma = self.gamma, alpha = self.alpha)
+        if train:
+            # backward here cause i don't want to worry about it otherwise
+            critic_loss.backward(retain_graph = True)
+
+        return critic_loss, policy_loss
+    
+    def step(self):
+        self.optimizer.step()
+        self.targets.ema(self.critics)
+                                      
+
