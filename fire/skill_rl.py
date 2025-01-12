@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from gymnasium import make
-from utils import ReplayBuffer, NormedSparseMLP, SACWrapper
+from utils import ReplayBuffer, NormedSparseMLP, SACWrapper, SkillConditionedPolicy
 from copy import deepcopy
 from tqdm import tqdm
 
@@ -59,49 +59,6 @@ class StateRepresenter(torch.nn.Module):
     def forward(self, obs):
         return self.encoder(obs)
     
-class SkillConditionedPolicy(torch.nn.Module):
-    def __init__(self,
-                 obs_dim,
-                 skill_dim,
-                 action_dim,
-                 discrete = False,
-                 variance = False,
-                 dims = [256, 128],
-                 sparsity = 0.2):
-        super().__init__()
-        self.obs_dim = obs_dim
-        self.skill_dim = skill_dim
-        self.action_dim = action_dim
-        self.discrete = discrete
-        self.variance = variance
-
-        self.actor_embed = NormedSparseMLP([obs_dim + skill_dim] + dims,
-                                           sparsity = sparsity)
-        self.actor = torch.nn.Linear(dims[-1], action_dim)
-        if self.variance:
-            self.logstd = torch.nn.Linear(dims[-1], action_dim)
-
-        self.softmax = torch.nn.Softmax(dim = -1)
-
-    def forward(self, obs, skill):
-        # paper doesn't say how both inputs layout, assume concat
-        x = torch.cat([obs, skill], dim = -1)
-        x = self.actor_embed(x)
-        if self.discrete:
-            return self.softmax(self.actor(x))
-        elif self.variance:
-            return self.actor(x), self.logstd(x)
-        return self.actor(x)
-    
-    def stochastic_sample(self, obs, skill):
-        assert self.variance
-        mu, logstd = self.forward(obs, skill)
-        std = torch.exp(logstd)
-
-        normal = torch.distributions.Normal(mu, std)
-        eps = normal.sample()
-        log_prob = normal.log_prob(eps).sum(dim = -1)
-        return mu + std * eps, log_prob
     
 class SuccessorEncoder(torch.nn.Module):
     def __init__(self,
@@ -135,7 +92,7 @@ def fill_buffer(env, policy, device, skill_space, buffer, pbar, counter):
         action, action_std = policy(torch.tensor(obs,
                                     device = device,
                                     dtype = torch.float32),
-                        skill)
+                                    skill = skill)
         action = action + action_std.exp() * torch.randn_like(action)
         next_obs, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
         done = (terminated or truncated) and (buffer.min_capacity < buffer.total)
@@ -167,7 +124,7 @@ def continuous_metra(n_epochs = 100,
 
     skill_space = ContinuousSkillSpace(skill_dim).to(device)
     state_representer = StateRepresenter(obs_dim, skill_dim).to(device)
-    policy = SkillConditionedPolicy(obs_dim, skill_dim, action_dim,
+    policy = SkillConditionedPolicy(obs_dim, action_dim, skill_dim = skill_dim,
                                     variance = True).to(device)
     sac_model = SACWrapper(obs_dim, action_dim).to(device)
     lam = torch.tensor(lam, device = device)
@@ -205,8 +162,8 @@ def continuous_metra(n_epochs = 100,
                                                                                  device = device)
             
             # new actions
-            new_actions, new_actions_std = policy(states, skills)
-            new_next_actions, next_actions_std = policy(next_states, skills)
+            new_actions, new_actions_std = policy(states, skill = skills)
+            new_next_actions, next_actions_std = policy(next_states, skill = skills)
 
             new_actions = new_actions + new_actions_std.exp() * torch.randn_like(new_actions)
             new_next_actions = new_next_actions + next_actions_std.exp() * torch.randn_like(new_next_actions)
@@ -272,7 +229,7 @@ def continuous_csf(n_epochs = 100,
 
     skill_space = ContinuousSkillSpace(skill_dim).to(device)
     state_representer = StateRepresenter(obs_dim, skill_dim).to(device)
-    policy = SkillConditionedPolicy(obs_dim, skill_dim, action_dim,
+    policy = SkillConditionedPolicy(obs_dim, action_dim, skill_dim = skill_dim,
                                     variance = True).to(device)
     sac_model = SACWrapper(obs_dim, action_dim,
                            #TODO : don't hardcode reward dim
@@ -314,8 +271,8 @@ def continuous_csf(n_epochs = 100,
                                                                                  device = device)
             
             # new actions
-            new_actions, new_actions_std = policy(states, skills)
-            new_next_actions, next_actions_std = policy(next_states, skills)
+            new_actions, new_actions_std = policy(states, skill = skills)
+            new_next_actions, next_actions_std = policy(next_states, skill = skills)
 
             new_actions = new_actions + new_actions_std.exp() * torch.randn_like(new_actions)
             new_next_actions = new_next_actions + next_actions_std.exp() * torch.randn_like(new_next_actions)
@@ -379,8 +336,8 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import os
     os.makedirs("tmp", exist_ok = True)
-    n_epochs = 50
-    episodes_per_epoch = 4
+    n_epochs = 960
+    episodes_per_epoch = 8
     traj_snapshot_every = n_epochs // 10
     smoothing_num = max(1, int(n_epochs / 10))
     smooth_kernel = np.ones(smoothing_num) / smoothing_num
