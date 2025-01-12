@@ -12,7 +12,7 @@ class ReplayBuffer:
                  action_dim,
                  special_buffer_dim = None,
                  capacity = int(1e4),
-                 min_capacity = 0.1):
+                 min_capacity = 1000):
         self.capacity = capacity
         if min_capacity < 1:
             min_capacity = int(capacity * min_capacity)
@@ -172,7 +172,7 @@ def sac_step(sample, policy, critics,
         next_action, next_log_pi = policy.stochastic_sample(next_states, skills)
         target_q1, target_q2 = critics(next_states, next_action)
         target_q = torch.min(target_q1, target_q2)
-        target_q = rewards + gamma * (1 - dones) * (target_q - alpha * next_log_pi)
+        target_q = rewards + gamma * (1 - dones) * (target_q - alpha * next_log_pi[:, None])
 
     q1, q2 = critics(states, actions)
     critic_loss = torch.nn.functional.mse_loss(q1, target_q) + torch.nn.functional.mse_loss(q2, target_q)

@@ -138,7 +138,7 @@ def fill_buffer(env, policy, device, skill_space, buffer, pbar, counter):
                         skill)
         action = action + action_std.exp() * torch.randn_like(action)
         next_obs, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
-        done = terminated or truncated
+        done = (terminated or truncated) and (buffer.min_capacity < buffer.total)
 
         buffer.push(obs, action, next_obs, done, reward = reward, special = skill)
         obs = next_obs
@@ -148,17 +148,124 @@ def fill_buffer(env, policy, device, skill_space, buffer, pbar, counter):
         ep_traj.append([info["x_position"], info["y_position"]])
     return ep_traj, counter
 
+def continuous_metra(n_epochs = 100,
+                     steps_per_epoch = 512,
+                     batch_size = 256,
+                     buffer_capacity = int(1e4),
+                     episodes_per_epoch = 4,
+                     gamma = 0.99,
+                     lam = 30,
+                     eps = 1e-3,
+                     skill_dim = 2,
+                     env_name = "Ant-v5",
+                     traj_snapshot_every = 10,
+                     save_model_every = 50):
+    env = make(env_name)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
 
-def main(n_epochs = 100,
-         steps_per_epoch = 512,
-         batch_size = 256,
-         buffer_capacity = int(1e4),
-         episodes_per_epoch = 4,
-         gamma = 0.99,
-         skill_dim = 2,
-         traj_snapshot_every = 10,
-         save_model_every = 50):
-    env = make("Ant-v5")
+    skill_space = ContinuousSkillSpace(skill_dim).to(device)
+    state_representer = StateRepresenter(obs_dim, skill_dim).to(device)
+    policy = SkillConditionedPolicy(obs_dim, skill_dim, action_dim,
+                                    variance = True).to(device)
+    sac_model = SACWrapper(obs_dim, action_dim).to(device)
+    lam = torch.tensor(lam, device = device)
+
+    optimizer_policy = torch.optim.Adam(policy.parameters(), lr = 1e-4)
+    optimizer_encoder = torch.optim.Adam(state_representer.parameters(), lr = 1e-4)
+    optimizer_lambda = torch.optim.Adam([lam], lr = 1e-4)
+
+    buffer = ReplayBuffer(obs_dim,
+                          action_dim,
+                          special_buffer_dim = skill_dim,
+                          capacity = buffer_capacity)
+    
+    pbar = tqdm(range(n_epochs * steps_per_epoch))
+    losses = []
+
+    xy_trajs = []
+
+    for epoch in range(n_epochs):
+        counter = 0
+        for ep in range(episodes_per_epoch):
+            ep_traj, counter = fill_buffer(env, policy, device,
+                                           skill_space, buffer, pbar,
+                                           counter)
+            # record all episodes for given epoch
+            if epoch % traj_snapshot_every == 0:
+                xy_trajs.append(ep_traj)
+            
+        for _ in range(steps_per_epoch):
+            optimizer_encoder.zero_grad()
+            optimizer_policy.zero_grad()
+            optimizer_lambda.zero_grad()
+
+            states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size,
+                                                                                 device = device)
+            
+            # new actions
+            new_actions, new_actions_std = policy(states, skills)
+            new_next_actions, next_actions_std = policy(next_states, skills)
+
+            new_actions = new_actions + new_actions_std.exp() * torch.randn_like(new_actions)
+            new_next_actions = new_next_actions + next_actions_std.exp() * torch.randn_like(new_next_actions)
+            
+            state_reps = state_representer(states)
+            next_state_reps = state_representer(next_states)
+
+            state_diffs = next_state_reps - state_reps
+
+            encoder_loss = -(state_diffs * skills).sum(dim=-1).mean()
+            #TODO : do we even need the optimizer here? derivative is easy
+            lambda_term = lam * torch.clamp(1 - state_diffs.norm(p = 2, dim = -1), max = eps)
+            encoder_loss -= lambda_term.mean()
+            lambda_loss = lambda_term.mean()
+
+            policy_reward = (state_diffs * skills).sum(dim=-1, keepdim = True)
+            critic_loss, policy_loss = sac_model([states, actions, rewards, next_states, dones, skills],
+                                                 policy,
+                                                 reward = policy_reward)
+            
+            encoder_loss.backward(retain_graph = True)
+            lambda_loss.backward()
+            policy_loss.backward()
+
+            optimizer_encoder.step()
+            optimizer_lambda.step()
+            sac_model.step()
+            optimizer_policy.step()
+
+            losses.append([encoder_loss.item(),
+                           policy_loss.item()])
+
+            pbar.update(1)
+            pbar.set_description(f"Epoch {epoch} | Loss {encoder_loss.item():.2f} | {critic_loss.item():.2f} | {policy_loss.item():.2f}")
+        if epoch % save_model_every == 0:
+            # save models
+            torch.save(state_representer.state_dict(),
+                    f"tmp/state_representer_{epoch}.pt")
+            torch.save(policy.state_dict(),
+                    f"tmp/policy_{epoch}.pt")
+            torch.save(sac_model.state_dict(),
+                       f"tmp/sac_model_{epoch}.pt")
+    return np.array(losses), xy_trajs
+
+def continuous_csf(n_epochs = 100,
+                   steps_per_epoch = 512,
+                   batch_size = 256,
+                   buffer_capacity = int(1e4),
+                   episodes_per_epoch = 4,
+                   gamma = 0.99,
+                   skill_dim = 2,
+                   env_name = "Ant-v5",
+                   traj_snapshot_every = 10,
+                   save_model_every = 50):
+    """
+    Continuous version of the method from this paper:
+    https://arxiv.org/abs/2412.08021
+    """
+    env = make(env_name)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -235,8 +342,8 @@ def main(n_epochs = 100,
 
             successor_loss = torch.nn.functional.mse_loss(successors,
                                                           successor_td.detach())
-            policy_reward = -(successors * skills).sum(dim=-1).mean()
-            policy_loss, _ = sac_model([states, actions, rewards, next_states, dones, skills],
+            policy_reward = (successors * skills).sum(dim=-1)
+            _, policy_loss = sac_model([states, actions, rewards, next_states, dones, skills],
                                        policy,
                                        reward = policy_reward)
             
@@ -273,21 +380,21 @@ if __name__ == "__main__":
     import os
     os.makedirs("tmp", exist_ok = True)
     n_epochs = 50
-    episodes_per_epoch = 8
+    episodes_per_epoch = 4
     traj_snapshot_every = n_epochs // 10
     smoothing_num = max(1, int(n_epochs / 10))
     smooth_kernel = np.ones(smoothing_num) / smoothing_num
 
-    losses, trajs = main(n_epochs = n_epochs,
-                         steps_per_epoch = 512,
-                         buffer_capacity = int(1e6),
-                         episodes_per_epoch = episodes_per_epoch,
-                         traj_snapshot_every = traj_snapshot_every,
-                         batch_size = 256)
+    losses, trajs = continuous_metra(n_epochs = n_epochs,
+                                   steps_per_epoch = 512,
+                                   buffer_capacity = int(1e6),
+                                   episodes_per_epoch = episodes_per_epoch,
+                                   traj_snapshot_every = traj_snapshot_every,
+                                   batch_size = 256)
 
     fig, ax = plt.subplots(1, 3, figsize = (12, 6))
     # plot the losses
-    for i, label in enumerate(["Encoder", "Successor", "Policy"]):
+    for i, label in enumerate(["Encoder", "Policy"]):
         smooth_losses = np.convolve(losses[:, i],
                                     smooth_kernel,
                                     mode = "valid")
