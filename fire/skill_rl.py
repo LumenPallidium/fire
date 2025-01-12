@@ -93,8 +93,7 @@ class SkillConditionedPolicy(torch.nn.Module):
             return self.actor(x), self.logstd(x)
         return self.actor(x)
     
-    def stochastic_sample(self, obs, skill,
-                          min_scale = None, max_scale = None):
+    def stochastic_sample(self, obs, skill):
         assert self.variance
         mu, logstd = self.forward(obs, skill)
         std = torch.exp(logstd)
@@ -125,6 +124,28 @@ class SuccessorEncoder(torch.nn.Module):
     def ema(self, other, alpha = 0.99):
         for p, q in zip(self.parameters(), other.parameters()):
             p.data = alpha * p.data + (1 - alpha) * q.data
+
+def fill_buffer(env, policy, device, skill_space, buffer, pbar, counter):
+    done = False
+    # fill buffer
+    obs, _ = env.reset()
+    skill = skill_space.sample().to(device)
+    ep_traj = []
+    while not done:
+        action = policy(torch.tensor(obs,
+                                    device = device,
+                                    dtype = torch.float32),
+                        skill)
+        next_obs, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
+        done = terminated or truncated
+
+        buffer.push(obs, action, next_obs, done, reward = reward, special = skill)
+        obs = next_obs
+        counter += 1
+        pbar.update(0)
+        pbar.set_description(f"Filling buffer {counter}/{buffer.capacity}")
+        ep_traj.append([info["x_position"], info["y_position"]])
+    return ep_traj, counter
 
 
 def main(n_epochs = 100,
@@ -165,25 +186,9 @@ def main(n_epochs = 100,
     for epoch in range(n_epochs):
         counter = 0
         for ep in range(episodes_per_epoch):
-            done = False
-            # fill buffer
-            obs, _ = env.reset()
-            skill = skill_space.sample().to(device)
-            ep_traj = []
-            while not done:
-                action = policy(torch.tensor(obs,
-                                            device = device,
-                                            dtype = torch.float32),
-                                skill)
-                next_obs, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
-                done = terminated or truncated
-
-                buffer.push(obs, action, next_obs, done, reward = reward, special = skill)
-                obs = next_obs
-                counter += 1
-                pbar.update(0)
-                pbar.set_description(f"Filling buffer {counter}/{buffer.capacity}")
-                ep_traj.append([info["x_position"], info["y_position"]])
+            ep_traj, counter = fill_buffer(env, policy, device,
+                                           skill_space, buffer, pbar,
+                                           counter)
             # record all episodes for given epoch
             if epoch % traj_snapshot_every == 0:
                 xy_trajs.append(ep_traj)
@@ -201,7 +206,6 @@ def main(n_epochs = 100,
             new_next_actions = policy(next_states, skills)
             
             state_reps = state_representer(states)
-            #TODO : paper doesn't say to stop the gradient, but it makes sense
             next_state_reps = state_representer(next_states)
             successors = successor_encoder(states, new_actions, skills)
 
@@ -212,9 +216,6 @@ def main(n_epochs = 100,
             nce_term = torch.einsum("bi,mi->bm",
                                     state_diffs,
                                     counterfactual_skills)
-            # skill_match = (skills[None, :] == skills[:, None]).all(dim = -1)
-            # set where they match to -inf i.e. remove them
-            # nce_term[skill_match] = -np.inf
             nce_term = torch.exp(nce_term).mean(dim = -1).log()
             encoder_loss += nce_term.mean()
 

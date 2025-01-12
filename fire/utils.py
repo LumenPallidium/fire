@@ -129,3 +129,60 @@ class NormedSparseMLP(torch.nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+    
+class DoubleQNetwork(torch.nn.Module):
+    """
+    A pair of Q-networks. Putting them in a single module because it makes
+    things clean and they are inseparable anyway.
+    """
+    def __init__(self,
+                 state_dim,
+                 action_dim,
+                 hidden_dims = [256, 256],
+                 activation = torch.nn.LeakyReLU()):
+        super(DoubleQNetwork, self).__init__()
+        self.q1 = NormedSparseMLP([state_dim + action_dim] + hidden_dims + [1])
+        self.q2 = NormedSparseMLP([state_dim + action_dim] + hidden_dims + [1])
+
+    def forward(self, state, action):
+        x = torch.cat([state, action], dim = -1)
+        return self.q1(x), self.q2(x)
+    
+    def ema(self, other, alpha = 0.995):
+        for p, q in zip(self.parameters(), other.parameters()):
+            p.data = alpha * p.data + (1 - alpha) * q.data
+    
+def sac_step(buffer, policy, critics, targets,
+             gamma = 0.99, device = None,
+             batch_size = 256, alpha = 0.01,
+             override_rewards = None):
+    """
+    A single step of Soft Actor Critic. Minimalist version based on CleanRL.
+    """
+    states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size,
+                                                                         device = device)
+
+    if override_rewards is not None:
+        rewards = override_rewards
+
+    # get the q values
+    with torch.no_grad():
+        next_action, next_log_pi = policy(next_states)
+        target_q1, target_q2 = critics(next_states, next_action)
+        target_q = torch.min(target_q1, target_q2)
+        target_q = rewards + gamma * (1 - dones) * (target_q - alpha * next_log_pi)
+
+    q1, q2 = critics(states, actions)
+    critic_loss = torch.nn.functional.mse_loss(q1, target_q) + torch.nn.functional.mse_loss(q2, target_q)
+
+    # update policy
+    new_action, log_pi = policy(states)
+    q1_new, q2_new = critics(states, new_action)
+    q_new = torch.min(q1_new, q2_new)
+
+    policy_loss = (alpha * log_pi - q_new).mean()
+
+    # update targets
+    targets.ema(critics)
+
+    return critic_loss, policy_loss
