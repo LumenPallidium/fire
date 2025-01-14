@@ -113,6 +113,7 @@ def continuous_metra(n_epochs = 100,
                      gamma = 0.99,
                      lam = 30,
                      eps = 1e-3,
+                     lr = 1e-4,
                      skill_dim = 2,
                      env_name = "Ant-v5",
                      traj_snapshot_every = 10,
@@ -126,12 +127,12 @@ def continuous_metra(n_epochs = 100,
     state_representer = StateRepresenter(obs_dim, skill_dim).to(device)
     policy = SkillConditionedPolicy(obs_dim, action_dim, skill_dim = skill_dim,
                                     variance = True).to(device)
-    sac_model = SACWrapper(obs_dim, action_dim).to(device)
-    lam = torch.tensor(lam, device = device)
+    sac_model = SACWrapper(obs_dim, action_dim,
+                           gamma = gamma).to(device)
+    lam = torch.tensor(lam, device = device, requires_grad = False)
 
-    optimizer_policy = torch.optim.Adam(policy.parameters(), lr = 1e-4)
-    optimizer_encoder = torch.optim.Adam(state_representer.parameters(), lr = 1e-4)
-    optimizer_lambda = torch.optim.Adam([lam], lr = 1e-4)
+    optimizer_policy = torch.optim.Adam(policy.parameters(), lr = lr)
+    optimizer_encoder = torch.optim.Adam(state_representer.parameters(), lr = lr)
 
     buffer = ReplayBuffer(obs_dim,
                           action_dim,
@@ -156,17 +157,9 @@ def continuous_metra(n_epochs = 100,
         for _ in range(steps_per_epoch):
             optimizer_encoder.zero_grad()
             optimizer_policy.zero_grad()
-            optimizer_lambda.zero_grad()
 
             states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size,
                                                                                  device = device)
-            
-            # new actions
-            new_actions, new_actions_std = policy(states, skill = skills)
-            new_next_actions, next_actions_std = policy(next_states, skill = skills)
-
-            new_actions = new_actions + new_actions_std.exp() * torch.randn_like(new_actions)
-            new_next_actions = new_next_actions + next_actions_std.exp() * torch.randn_like(new_next_actions)
             
             state_reps = state_representer(states)
             next_state_reps = state_representer(next_states)
@@ -174,22 +167,21 @@ def continuous_metra(n_epochs = 100,
             state_diffs = next_state_reps - state_reps
 
             encoder_loss = -(state_diffs * skills).sum(dim=-1).mean()
-            #TODO : do we even need the optimizer here? derivative is easy
-            lambda_term = lam * torch.clamp(1 - state_diffs.norm(p = 2, dim = -1), max = eps)
-            encoder_loss -= lambda_term.mean()
-            lambda_loss = lambda_term.mean()
+            lambda_term = torch.clamp(1 - state_diffs.norm(p = 2, dim = -1), max = eps)
+            encoder_loss -= lam * lambda_term.mean()
 
             policy_reward = (state_diffs * skills).sum(dim=-1, keepdim = True)
             critic_loss, policy_loss = sac_model([states, actions, rewards, next_states, dones, skills],
                                                  policy,
                                                  reward = policy_reward)
             
-            encoder_loss.backward(retain_graph = True)
-            lambda_loss.backward()
+            encoder_loss.backward()
             policy_loss.backward()
 
             optimizer_encoder.step()
-            optimizer_lambda.step()
+            with torch.no_grad():
+                # gradient descent manually
+                lam = lam - lr * lambda_term.mean()
             sac_model.step()
             optimizer_policy.step()
 

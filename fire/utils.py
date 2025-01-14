@@ -139,6 +139,7 @@ class SkillConditionedPolicy(torch.nn.Module):
                  discrete = False,
                  variance = False,
                  dims = [256, 128],
+                 log_std_min_max = (-5, 2),
                  sparsity = 0.2):
         super().__init__()
         self.obs_dim = obs_dim
@@ -148,6 +149,7 @@ class SkillConditionedPolicy(torch.nn.Module):
         self.action_dim = action_dim
         self.discrete = discrete
         self.variance = variance
+        self.log_std_min_max = log_std_min_max
 
         self.actor_embed = NormedSparseMLP([obs_dim + skill_dim] + dims,
                                            sparsity = sparsity)
@@ -165,7 +167,12 @@ class SkillConditionedPolicy(torch.nn.Module):
         if self.discrete:
             return self.softmax(self.actor(x))
         elif self.variance:
-            return self.actor(x), self.logstd(x)
+            act = torch.tanh(self.actor(x))
+            log_std = self.logstd(x)
+            log_std = torch.clamp(log_std,
+                                  self.log_std_min_max[0],
+                                  self.log_std_min_max[1])
+            return act, log_std
         return self.actor(x)
     
     def stochastic_sample(self, obs, skill = None):
@@ -231,7 +238,7 @@ def sac_step(sample, policy, critics,
 
     policy_loss = (alpha * log_pi - q_new).mean()
 
-    return critic_loss, policy_loss
+    return critic_loss, policy_loss, log_pi
 
 class SACWrapper(torch.nn.Module):
     """
@@ -244,26 +251,33 @@ class SACWrapper(torch.nn.Module):
                  critic_dims = [256, 256],
                  reward_dim = 1,
                  activation = torch.nn.LeakyReLU(),
-                 lr = 1e-4,
+                 lr = 3e-4,
                  gamma = 0.99,
-                 alpha = 0.995):
+                 alpha = 0.995,
+                 entropy_alpha = 0.01,
+                 target_entropy = None):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.gamma = gamma
         self.alpha = alpha
+        self.entropy_alpha = entropy_alpha
+        self.target_entropy = target_entropy
+        self.last_log_pi = None
 
         self.critics = DoubleQNetwork(state_dim, action_dim,
                                       hidden_dims = critic_dims,
                                       reward_dim = reward_dim,
-                                      activation = activation)
+                                      activation = activation,)
         self.targets = deepcopy(self.critics).requires_grad_(False)
         self.optimizer = torch.optim.Adam(self.critics.parameters(), lr = lr)
 
     def forward(self, sample, policy, reward = None, train = True):
-        critic_loss, policy_loss = sac_step(sample, policy, self.critics,
-                                            override_rewards = reward,
-                                            gamma = self.gamma, alpha = self.alpha)
+        critic_loss, policy_loss, log_pi = sac_step(sample, policy, self.critics,
+                                                override_rewards = reward,
+                                                gamma = self.gamma,
+                                                alpha = self.entropy_alpha)
+        self.last_log_pi = log_pi
         if train:
             # backward here cause i don't want to worry about it otherwise
             critic_loss.backward(retain_graph = True)
@@ -271,8 +285,25 @@ class SACWrapper(torch.nn.Module):
         return critic_loss, policy_loss
     
     def step(self):
+        self.optimizer.zero_grad()
         self.optimizer.step()
-        self.targets.ema(self.critics)
+        self.targets.ema(self.critics, alpha = self.alpha)
+        if self.target_entropy is not None:
+            step = self.last_log_pi.mean().detach().item() + self.target_entropy
+            self.entropy_alpha = min(1.0, max(0.0, self.entropy_alpha + 1e-4 *step))
+
+class IntScheduler:
+    def __init__(self, start, end, n_steps = 100):
+        self.start = start
+        self.end = end
+        self.n_steps = n_steps
+        self.slope = (end - start) / n_steps
+
+    def __call__(self, step):
+        if step >= self.n_steps:
+            return self.end
+        val = self.start + self.slope * step
+        return int(val)
                                       
 
 if __name__ == "__main__":
@@ -281,10 +312,10 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     from tqdm import tqdm
     env_name = "LunarLanderContinuous-v2"
-    n_epochs = 1000
-    steps_per_epoch = 16
+    n_epochs = 3000 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
+    steps_per_epoch = 8
     batch_size = 256
-    episodes_per_epoch = 4
+    episodes_per_epoch = 8
 
     env = gym.make(env_name)
     state_dim = env.observation_space.shape[0]
@@ -295,26 +326,29 @@ if __name__ == "__main__":
     critics = SACWrapper(state_dim, action_dim).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr = 1e-4)
 
-    buffer = ReplayBuffer(state_dim, action_dim, capacity = 100000)
+    buffer = ReplayBuffer(state_dim, action_dim, capacity = 5000)
 
     pbar = tqdm(total = n_epochs * steps_per_epoch + episodes_per_epoch * n_epochs)
     losses = []
+    total_rewards = []
 
     for epoch in range(n_epochs):
         counter = 0
         for ep in range(episodes_per_epoch):
             state, _ = env.reset()
             done = False
+            total_reward = 0
             while not done:
                 with torch.no_grad():
-                    action, action_std = policy.stochastic_sample(torch.tensor(state, dtype = torch.float32, device = device))
-                action += action_std.exp() * torch.randn_like(action)
+                    action, action_log_probs = policy.stochastic_sample(torch.tensor(state, dtype = torch.float32, device = device))
                 next_state, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
                 buffer.push(state, action, next_state, done, reward)
+                total_reward += reward
                 state = next_state
                 counter += 1
-                done = terminated or truncated
+                done = (terminated or truncated)
                 pbar.set_description(f"Epoch {epoch} | B{ep} | E{counter}")
+            total_rewards.append(total_reward)
             pbar.update(1)
         for _ in range(steps_per_epoch):
             optimizer.zero_grad()
@@ -325,22 +359,30 @@ if __name__ == "__main__":
             critic_loss, policy_loss = critics((states, actions, rewards, next_states, dones, skills),
                                                policy, train = True)
             
-            critic_loss.backward(retain_graph = True)
             policy_loss.backward()
-
             critics.step()
             optimizer.step()
 
-            losses.append([critic_loss.item(), policy_loss.item(), rewards.mean().item()])
+            losses.append([critic_loss.item(), policy_loss.item()])
 
             pbar.update(1)
             pbar.set_description(f"Epoch {epoch} | {critic_loss.item():.2f} | {policy_loss.item():.2f}")
     
     pbar.close()
     losses = np.array(losses)
+
     fig, ax = plt.subplots(3, 1, figsize = (12, 8))
-    smooth_losses = np.apply_along_axis(lambda x: np.convolve(x, np.ones(5) / 5, mode = "valid"),
+    smooth_losses = np.apply_along_axis(lambda x: np.convolve(x, np.ones(500) / 500, mode = "valid"),
                                         axis = 0, arr = losses)
-    ax[0].plot(smooth_losses[:, 0], label = "Critic Loss")
-    ax[1].plot(smooth_losses[:, 1], label = "Policy Loss")
-    ax[2].plot(smooth_losses[:, 2], label = "Reward")
+    ax[0].plot(smooth_losses[:, 0])
+    ax[0].set_title("Critic Loss")
+    ax[1].plot(smooth_losses[:, 1])
+    ax[1].set_title("Policy Loss")
+
+    total_rewards = np.array(total_rewards)
+    smooth_rewards = np.convolve(total_rewards.squeeze(),
+                                 np.ones(50) / 50, mode = "valid")
+
+    ax[2].plot(smooth_rewards)
+    ax[2].set_title("Reward")
+    plt.tight_layout()
