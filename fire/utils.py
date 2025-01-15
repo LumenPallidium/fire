@@ -119,8 +119,8 @@ class NormedSparseMLP(torch.nn.Module):
 
         self.layers = []
         for i in range(1, len(dims)):
+            self.layers.append(torch.nn.LayerNorm(dims[i - 1], elementwise_affine = False))
             self.layers.append(SparseLinear(dims[i-1], dims[i], sparsity))
-            self.layers.append(torch.nn.LayerNorm(dims[i], elementwise_affine = False))
             if i < len(dims) - 1:
                 self.layers.append(activation)
 
@@ -167,7 +167,7 @@ class SkillConditionedPolicy(torch.nn.Module):
         if self.discrete:
             return self.softmax(self.actor(x))
         elif self.variance:
-            act = torch.tanh(self.actor(x))
+            act = self.actor(x)
             log_std = self.logstd(x)
             log_std = torch.clamp(log_std,
                                   self.log_std_min_max[0],
@@ -181,9 +181,9 @@ class SkillConditionedPolicy(torch.nn.Module):
         std = torch.exp(logstd)
 
         normal = torch.distributions.Normal(mu, std)
-        eps = normal.sample()
-        log_prob = normal.log_prob(eps).sum(dim = -1)
-        return mu + std * eps, log_prob
+        action = normal.sample()
+        log_prob = normal.log_prob(action).sum(dim = -1)
+        return action, log_prob
 
 class DoubleQNetwork(torch.nn.Module):
     """
@@ -195,11 +195,14 @@ class DoubleQNetwork(torch.nn.Module):
                  action_dim,
                  hidden_dims = [256, 256],
                  reward_dim = 1,
-                 activation = torch.nn.LeakyReLU()):
+                 activation = torch.nn.LeakyReLU(),
+                 sparsity = 0.2):
         super(DoubleQNetwork, self).__init__()
         self.q1 = NormedSparseMLP([state_dim + action_dim] + hidden_dims + [reward_dim],
+                                  sparsity=sparsity,
                                   activation=activation)
         self.q2 = NormedSparseMLP([state_dim + action_dim] + hidden_dims + [reward_dim],
+                                  sparsity=sparsity,
                                   activation=activation)
 
     def forward(self, state, action):
@@ -209,41 +212,12 @@ class DoubleQNetwork(torch.nn.Module):
     def ema(self, other, alpha = 0.995):
         for p, q in zip(self.parameters(), other.parameters()):
             p.data = alpha * p.data + (1 - alpha) * q.data
-    
-def sac_step(sample, policy, critics,
-             gamma = 0.99, alpha = 0.01,
-             override_rewards = None):
-    """
-    A single step of Soft Actor Critic. Minimalist version based on CleanRL.
-    """
-    states, actions, rewards, next_states, dones, skills = sample
 
-    if override_rewards is not None:
-        rewards = override_rewards.detach()
-
-    # get the q values
-    with torch.no_grad():
-        next_action, next_log_pi = policy.stochastic_sample(next_states, skills)
-        target_q1, target_q2 = critics(next_states, next_action)
-        target_q = torch.min(target_q1, target_q2)
-        target_q = rewards + gamma * (1 - dones) * (target_q - alpha * next_log_pi[:, None])
-
-    q1, q2 = critics(states, actions)
-    critic_loss = torch.nn.functional.mse_loss(q1, target_q) + torch.nn.functional.mse_loss(q2, target_q)
-
-    # update policy
-    new_action, log_pi = policy.stochastic_sample(states, skills)
-    q1_new, q2_new = critics(states, new_action)
-    q_new = torch.min(q1_new, q2_new)
-
-    policy_loss = (alpha * log_pi - q_new).mean()
-
-    return critic_loss, policy_loss, log_pi
 
 class SACWrapper(torch.nn.Module):
     """
     Convenience wrapper so we can do most SAC steps in a single call and
-    not worry about the critics and targers.
+    not worry about the critics and targets.
     """
     def __init__(self,
                  state_dim,
@@ -251,7 +225,7 @@ class SACWrapper(torch.nn.Module):
                  critic_dims = [256, 256],
                  reward_dim = 1,
                  activation = torch.nn.LeakyReLU(),
-                 lr = 3e-4,
+                 lr = 1e-4,
                  gamma = 0.99,
                  alpha = 0.995,
                  entropy_alpha = 0.01,
@@ -272,20 +246,51 @@ class SACWrapper(torch.nn.Module):
         self.targets = deepcopy(self.critics).requires_grad_(False)
         self.optimizer = torch.optim.Adam(self.critics.parameters(), lr = lr)
 
+    def sac_step(self, sample, policy,
+                override_rewards = None,
+                train_critic = True):
+        """
+        A single step of Soft Actor Critic. Minimalist version based on CleanRL.
+        """
+        states, actions, rewards, next_states, dones, skills = sample
+
+        if override_rewards is not None:
+            rewards = override_rewards.detach()
+
+        # get the q values
+        with torch.no_grad():
+            next_action, next_log_pi = policy.stochastic_sample(next_states,
+                                                                skill = skills)
+            target_q1, target_q2 = self.critics(next_states, next_action)
+            target_q = torch.min(target_q1, target_q2)
+            target_q = rewards + self.gamma * (1 - dones) * (target_q - self.entropy_alpha * next_log_pi[:, None])
+
+        q1, q2 = self.critics(states, actions)
+        critic_loss = torch.nn.functional.mse_loss(q1, target_q) + torch.nn.functional.mse_loss(q2, target_q)
+        self.last_log_pi = next_log_pi.detach().mean()
+        if train_critic:
+            self.optimizer.zero_grad()
+            critic_loss.backward()
+            self.step()
+
+        # update policy
+        new_action, log_pi = policy.stochastic_sample(states, skills)
+        q1_new, q2_new = self.critics(states, new_action)
+        q_new = torch.min(q1_new, q2_new)
+
+        policy_loss = (self.entropy_alpha * log_pi - q_new).mean()
+
+        return critic_loss, policy_loss
+
     def forward(self, sample, policy, reward = None, train = True):
-        critic_loss, policy_loss, log_pi = sac_step(sample, policy, self.critics,
-                                                override_rewards = reward,
-                                                gamma = self.gamma,
-                                                alpha = self.entropy_alpha)
-        self.last_log_pi = log_pi
-        if train:
-            # backward here cause i don't want to worry about it otherwise
-            critic_loss.backward(retain_graph = True)
+
+        critic_loss, policy_loss = self.sac_step(sample, policy, 
+                                                         override_rewards = reward,
+                                                         train_critic = train)
 
         return critic_loss, policy_loss
     
     def step(self):
-        self.optimizer.zero_grad()
         self.optimizer.step()
         self.targets.ema(self.critics, alpha = self.alpha)
         if self.target_entropy is not None:
@@ -312,18 +317,22 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     from tqdm import tqdm
     env_name = "LunarLanderContinuous-v2"
-    n_epochs = 3000 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
+    n_epochs = 1000 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
     steps_per_epoch = 8
     batch_size = 256
     episodes_per_epoch = 8
+    policy_no_update_steps = n_epochs // 20
 
     env = gym.make(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
+    targt_entropy = -action_dim
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    policy = SkillConditionedPolicy(state_dim, action_dim, variance = True).to(device)
-    critics = SACWrapper(state_dim, action_dim).to(device)
+    policy = SkillConditionedPolicy(state_dim, action_dim,
+                                    variance = True).to(device)
+    critics = SACWrapper(state_dim, action_dim,
+                         target_entropy = targt_entropy).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr = 1e-4)
 
     buffer = ReplayBuffer(state_dim, action_dim, capacity = 5000)
@@ -347,21 +356,20 @@ if __name__ == "__main__":
                 state = next_state
                 counter += 1
                 done = (terminated or truncated)
-                pbar.set_description(f"Epoch {epoch} | B{ep} | E{counter}")
+                pbar.set_description(f"Epoch {epoch} | R{total_reward} | E{counter}")
             total_rewards.append(total_reward)
             pbar.update(1)
         for _ in range(steps_per_epoch):
-            optimizer.zero_grad()
-
             states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size,
                                                                                  device = device)
             
             critic_loss, policy_loss = critics((states, actions, rewards, next_states, dones, skills),
                                                policy, train = True)
             
-            policy_loss.backward()
-            critics.step()
-            optimizer.step()
+            if epoch > policy_no_update_steps:
+                optimizer.zero_grad()    
+                policy_loss.backward()        
+                optimizer.step()
 
             losses.append([critic_loss.item(), policy_loss.item()])
 
@@ -381,7 +389,7 @@ if __name__ == "__main__":
 
     total_rewards = np.array(total_rewards)
     smooth_rewards = np.convolve(total_rewards.squeeze(),
-                                 np.ones(50) / 50, mode = "valid")
+                                 np.ones(100) / 100, mode = "valid")
 
     ax[2].plot(smooth_rewards)
     ax[2].set_title("Reward")
