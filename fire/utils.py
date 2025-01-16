@@ -181,9 +181,12 @@ class SkillConditionedPolicy(torch.nn.Module):
         std = torch.exp(logstd)
 
         normal = torch.distributions.Normal(mu, std)
-        action = normal.sample()
-        log_prob = normal.log_prob(action).sum(dim = -1)
-        return action, log_prob
+        action = normal.rsample()
+
+        action_tanh = torch.tanh(action)
+        log_prob = normal.log_prob(action)
+        log_prob -= torch.log((1 - action_tanh.pow(2)) + 1e-6)
+        return action_tanh, log_prob.sum(dim = -1)
 
 class DoubleQNetwork(torch.nn.Module):
     """
@@ -210,7 +213,10 @@ class DoubleQNetwork(torch.nn.Module):
         return self.q1(x), self.q2(x)
     
     def ema(self, other, alpha = 0.995):
-        for p, q in zip(self.parameters(), other.parameters()):
+        # doing the networks separately to be safe
+        for p, q in zip(self.q1.parameters(), other.q1.parameters()):
+            p.data = alpha * p.data + (1 - alpha) * q.data
+        for p, q in zip(self.q2.parameters(), other.q2.parameters()):
             p.data = alpha * p.data + (1 - alpha) * q.data
 
 
@@ -285,8 +291,8 @@ class SACWrapper(torch.nn.Module):
     def forward(self, sample, policy, reward = None, train = True):
 
         critic_loss, policy_loss = self.sac_step(sample, policy, 
-                                                         override_rewards = reward,
-                                                         train_critic = train)
+                                                 override_rewards = reward,
+                                                 train_critic = train)
 
         return critic_loss, policy_loss
     
@@ -321,12 +327,12 @@ if __name__ == "__main__":
     steps_per_epoch = 8
     batch_size = 256
     episodes_per_epoch = 8
-    policy_no_update_steps = n_epochs // 20
+    policy_no_update_steps = 10
 
     env = gym.make(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    targt_entropy = -action_dim
+    targt_entropy = None
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     policy = SkillConditionedPolicy(state_dim, action_dim,
@@ -335,11 +341,12 @@ if __name__ == "__main__":
                          target_entropy = targt_entropy).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr = 1e-4)
 
-    buffer = ReplayBuffer(state_dim, action_dim, capacity = 5000)
+    buffer = ReplayBuffer(state_dim, action_dim, capacity = 10000)
 
     pbar = tqdm(total = n_epochs * steps_per_epoch + episodes_per_epoch * n_epochs)
     losses = []
     total_rewards = []
+    running_reward = 0
 
     for epoch in range(n_epochs):
         counter = 0
@@ -349,15 +356,21 @@ if __name__ == "__main__":
             total_reward = 0
             while not done:
                 with torch.no_grad():
-                    action, action_log_probs = policy.stochastic_sample(torch.tensor(state, dtype = torch.float32, device = device))
+                    action, action_log_probs = policy.stochastic_sample(torch.tensor(state,
+                                                                                     dtype = torch.float32,
+                                                                                     device = device))
                 next_state, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
                 buffer.push(state, action, next_state, done, reward)
                 total_reward += reward
                 state = next_state
                 counter += 1
                 done = (terminated or truncated)
-                pbar.set_description(f"Epoch {epoch} | R{total_reward} | E{counter}")
+                pbar.set_description(f"Epoch {epoch} | R{running_reward:.2f} | E{counter}")
             total_rewards.append(total_reward)
+            running_reward = 0.01 * total_reward + (1 - 0.01) * running_reward
+            # stop if we are doing well
+            if counter > buffer.capacity:
+                break
             pbar.update(1)
         for _ in range(steps_per_epoch):
             states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size,
@@ -374,7 +387,7 @@ if __name__ == "__main__":
             losses.append([critic_loss.item(), policy_loss.item()])
 
             pbar.update(1)
-            pbar.set_description(f"Epoch {epoch} | {critic_loss.item():.2f} | {policy_loss.item():.2f}")
+            pbar.set_description(f"Epoch {epoch} |R {running_reward:.2f}| {critic_loss.item():.2f} | {policy_loss.item():.2f}")
     
     pbar.close()
     losses = np.array(losses)
