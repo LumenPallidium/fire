@@ -234,14 +234,15 @@ class SACWrapper(torch.nn.Module):
                  lr = 1e-4,
                  gamma = 0.99,
                  alpha = 0.995,
-                 entropy_alpha = 0.01,
+                 log_entropy_alpha = torch.tensor(0),
                  target_entropy = None):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.gamma = gamma
         self.alpha = alpha
-        self.entropy_alpha = entropy_alpha
+        self.log_entropy_alpha = log_entropy_alpha
+        self.entropy_alpha = log_entropy_alpha.exp()
         self.target_entropy = target_entropy
         self.last_log_pi = None
 
@@ -251,6 +252,10 @@ class SACWrapper(torch.nn.Module):
                                       activation = activation,)
         self.targets = deepcopy(self.critics).requires_grad_(False)
         self.optimizer = torch.optim.Adam(self.critics.parameters(), lr = lr)
+
+        if target_entropy is not None:
+            self.log_entropy_alpha = torch.nn.Parameter(torch.tensor(0.0))
+            self.entropy_optimizer = torch.optim.Adam([self.log_entropy_alpha], lr = lr)
 
     def sac_step(self, sample, policy,
                 override_rewards = None,
@@ -278,7 +283,7 @@ class SACWrapper(torch.nn.Module):
             self.optimizer.zero_grad()
             critic_loss.backward()
             self.step()
-
+            
         # update policy
         new_action, log_pi = policy.stochastic_sample(states, skills)
         q1_new, q2_new = self.critics(states, new_action)
@@ -298,10 +303,15 @@ class SACWrapper(torch.nn.Module):
     
     def step(self):
         self.optimizer.step()
-        self.targets.ema(self.critics, alpha = self.alpha)
         if self.target_entropy is not None:
-            step = self.last_log_pi.mean().detach().item() + self.target_entropy
-            self.entropy_alpha = min(1.0, max(0.0, self.entropy_alpha + 1e-4 *step))
+            self.entropy_optimizer.zero_grad()
+            self.entropy_alpha = self.log_entropy_alpha.detach().exp()
+            entropy_loss = -(self.log_entropy_alpha * (self.last_log_pi + self.target_entropy).detach()).mean()
+            entropy_loss.backward()
+            self.entropy_optimizer.step()
+    
+    def update_targets(self):
+        self.targets.ema(self.critics, alpha = self.alpha)
 
 class IntScheduler:
     def __init__(self, start, end, n_steps = 100):
@@ -323,16 +333,16 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     from tqdm import tqdm
     env_name = "LunarLanderContinuous-v2"
-    n_epochs = 1000 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
-    steps_per_epoch = 8
+    n_epochs = 2000 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
+    steps_per_epoch = 1
     batch_size = 256
-    episodes_per_epoch = 8
-    policy_no_update_steps = 10
+    episodes_per_epoch = 1
+    train_start_steps = 10000
 
     env = gym.make(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    targt_entropy = None
+    targt_entropy = -action_dim
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     policy = SkillConditionedPolicy(state_dim, action_dim,
@@ -341,16 +351,18 @@ if __name__ == "__main__":
                          target_entropy = targt_entropy).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr = 1e-4)
 
-    buffer = ReplayBuffer(state_dim, action_dim, capacity = 10000)
+    buffer = ReplayBuffer(state_dim, action_dim, capacity = 1000000)
 
     pbar = tqdm(total = n_epochs * steps_per_epoch + episodes_per_epoch * n_epochs)
     losses = []
     total_rewards = []
     running_reward = 0
+    total_steps = 0
 
     for epoch in range(n_epochs):
         counter = 0
         for ep in range(episodes_per_epoch):
+            policy.eval()
             state, _ = env.reset()
             done = False
             total_reward = 0
@@ -364,30 +376,33 @@ if __name__ == "__main__":
                 total_reward += reward
                 state = next_state
                 counter += 1
+                total_steps += 1
+
                 done = (terminated or truncated)
-                pbar.set_description(f"Epoch {epoch} | R{running_reward:.2f} | E{counter}")
+                pbar.set_description(f"Epoch {epoch} | R{running_reward:.2f} | S{total_steps}")
             total_rewards.append(total_reward)
             running_reward = 0.01 * total_reward + (1 - 0.01) * running_reward
-            # stop if we are doing well
-            if counter > buffer.capacity:
-                break
-            pbar.update(1)
-        for _ in range(steps_per_epoch):
-            states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size,
-                                                                                 device = device)
-            
-            critic_loss, policy_loss = critics((states, actions, rewards, next_states, dones, skills),
-                                               policy, train = True)
-            
-            if epoch > policy_no_update_steps:
+            if total_steps > train_start_steps:
+                pbar.update(1)
+        if total_steps > train_start_steps:
+            policy.train()
+            for _ in range(steps_per_epoch):
+                states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size,
+                                                                                    device = device)
+                
+                critic_loss, policy_loss = critics((states, actions, rewards, next_states, dones, skills),
+                                                policy, train = True)
+                
                 optimizer.zero_grad()    
                 policy_loss.backward()        
                 optimizer.step()
 
-            losses.append([critic_loss.item(), policy_loss.item()])
+                critics.update_targets()
 
-            pbar.update(1)
-            pbar.set_description(f"Epoch {epoch} |R {running_reward:.2f}| {critic_loss.item():.2f} | {policy_loss.item():.2f}")
+                losses.append([critic_loss.item(), policy_loss.item()])
+
+                pbar.update(1)
+                pbar.set_description(f"Epoch {epoch} |R {running_reward:.2f}| {critic_loss.item():.2f} | {policy_loss.item():.2f}")
     
     pbar.close()
     losses = np.array(losses)
