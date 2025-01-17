@@ -89,11 +89,10 @@ def fill_buffer(env, policy, device, skill_space, buffer, pbar, counter):
     skill = skill_space.sample().to(device)
     ep_traj = []
     while not done:
-        action, action_std = policy(torch.tensor(obs,
-                                    device = device,
-                                    dtype = torch.float32),
-                                    skill = skill)
-        action = action + action_std.exp() * torch.randn_like(action)
+        action, _ = policy.stochastic_sample(torch.tensor(obs,
+                                             device = device,
+                                             dtype = torch.float32),
+                                             skill = skill)
         next_obs, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
         done = (terminated or truncated) and (buffer.min_capacity < buffer.total)
 
@@ -122,12 +121,14 @@ def continuous_metra(n_epochs = 100,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
+    target_entropy = -action_dim
 
     skill_space = ContinuousSkillSpace(skill_dim).to(device)
     state_representer = StateRepresenter(obs_dim, skill_dim).to(device)
     policy = SkillConditionedPolicy(obs_dim, action_dim, skill_dim = skill_dim,
                                     variance = True).to(device)
     sac_model = SACWrapper(obs_dim, action_dim,
+                           target_entropy=target_entropy,
                            gamma = gamma).to(device)
     lam = torch.tensor(lam, device = device, requires_grad = False)
 
@@ -143,6 +144,7 @@ def continuous_metra(n_epochs = 100,
     losses = []
 
     xy_trajs = []
+    dists = []
 
     for epoch in range(n_epochs):
         counter = 0
@@ -153,6 +155,9 @@ def continuous_metra(n_epochs = 100,
             # record all episodes for given epoch
             if epoch % traj_snapshot_every == 0:
                 xy_trajs.append(ep_traj)
+            # always record dists
+            dist = np.linalg.norm(np.array(ep_traj[0]) - np.array(ep_traj[-1]))
+            dists.append(dist)
             
         for _ in range(steps_per_epoch):
             optimizer_encoder.zero_grad()
@@ -181,15 +186,16 @@ def continuous_metra(n_epochs = 100,
             optimizer_encoder.step()
             with torch.no_grad():
                 # gradient descent manually
-                lam = lam - lr * lambda_term.mean()
-            sac_model.step()
+                lam = lam - 0.1 * lambda_term.mean()
             optimizer_policy.step()
+
+            sac_model.update_targets()
 
             losses.append([encoder_loss.item(),
                            policy_loss.item()])
 
             pbar.update(1)
-            pbar.set_description(f"Epoch {epoch} | Loss {encoder_loss.item():.2f} | {critic_loss.item():.2f} | {policy_loss.item():.2f}")
+            pbar.set_description(f"Epoch {epoch} | Loss {encoder_loss.item():.2f} | {policy_loss.item():.2f} | lam {lam.item():.2f}")
         if epoch % save_model_every == 0:
             # save models
             torch.save(state_representer.state_dict(),
@@ -198,7 +204,7 @@ def continuous_metra(n_epochs = 100,
                     f"tmp/policy_{epoch}.pt")
             torch.save(sac_model.state_dict(),
                        f"tmp/sac_model_{epoch}.pt")
-    return np.array(losses), xy_trajs
+    return np.array(losses), xy_trajs, dists
 
 def continuous_csf(n_epochs = 100,
                    steps_per_epoch = 512,
@@ -304,6 +310,7 @@ def continuous_csf(n_epochs = 100,
             optimizer_successor.step()
             sac_model.step()
             optimizer_policy.step()
+            sac_model.update_targets()
 
             successor_encoder_ema.ema(successor_encoder)
             losses.append([encoder_loss.item(),
@@ -328,18 +335,19 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import os
     os.makedirs("tmp", exist_ok = True)
-    n_epochs = 960
+    n_epochs = 400
     episodes_per_epoch = 8
+    steps_per_epoch = 200
     traj_snapshot_every = n_epochs // 10
     smoothing_num = max(1, int(n_epochs / 10))
     smooth_kernel = np.ones(smoothing_num) / smoothing_num
 
-    losses, trajs = continuous_metra(n_epochs = n_epochs,
-                                   steps_per_epoch = 512,
-                                   buffer_capacity = int(1e6),
-                                   episodes_per_epoch = episodes_per_epoch,
-                                   traj_snapshot_every = traj_snapshot_every,
-                                   batch_size = 256)
+    losses, trajs, dists = continuous_metra(n_epochs = n_epochs,
+                                            steps_per_epoch = steps_per_epoch,
+                                            buffer_capacity = int(1e6),
+                                            episodes_per_epoch = episodes_per_epoch,
+                                            traj_snapshot_every = traj_snapshot_every,
+                                            batch_size = 256)
 
     fig, ax = plt.subplots(1, 3, figsize = (12, 6))
     # plot the losses
@@ -357,9 +365,11 @@ if __name__ == "__main__":
         alpha = (i / len(trajs))
         ax[1].plot(traj[:, 0], traj[:, 1], alpha = alpha)
 
-        # lastly get mean distance travelled over time
-        dists = np.linalg.norm(traj[0, :] - traj[-1, :], axis = -1)
-        dists_time.append(dists)
-    ax[2].plot(dists_time)
+    # smooth
+    dists_time_np = np.array(dists)
+    dists_time_np = np.convolve(dists_time_np,
+                                smooth_kernel,
+                                mode = "valid")
+    ax[2].plot(dists_time_np)
 
     fig.savefig("tmp/skill_results.png", dpi = 300)

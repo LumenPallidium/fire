@@ -333,11 +333,13 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     from tqdm import tqdm
     env_name = "LunarLanderContinuous-v2"
-    n_epochs = 2000 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
+    n_epochs = 1500 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
     steps_per_epoch = 1
     batch_size = 256
     episodes_per_epoch = 1
     train_start_steps = 10000
+    time_penalty = -2e-2
+    penalty_start = 200
 
     env = gym.make(env_name)
     state_dim = env.observation_space.shape[0]
@@ -353,11 +355,11 @@ if __name__ == "__main__":
 
     buffer = ReplayBuffer(state_dim, action_dim, capacity = 1000000)
 
+    total_steps = 0
     pbar = tqdm(total = n_epochs * steps_per_epoch + episodes_per_epoch * n_epochs)
     losses = []
     total_rewards = []
     running_reward = 0
-    total_steps = 0
 
     for epoch in range(n_epochs):
         counter = 0
@@ -366,17 +368,22 @@ if __name__ == "__main__":
             state, _ = env.reset()
             done = False
             total_reward = 0
+            step = 0
             while not done:
                 with torch.no_grad():
                     action, action_log_probs = policy.stochastic_sample(torch.tensor(state,
                                                                                      dtype = torch.float32,
                                                                                      device = device))
                 next_state, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
+                if step > penalty_start:
+                    reward += time_penalty
                 buffer.push(state, action, next_state, done, reward)
                 total_reward += reward
                 state = next_state
+
                 counter += 1
                 total_steps += 1
+                step += 1
 
                 done = (terminated or truncated)
                 pbar.set_description(f"Epoch {epoch} | R{running_reward:.2f} | S{total_steps}")
@@ -419,6 +426,6 @@ if __name__ == "__main__":
     smooth_rewards = np.convolve(total_rewards.squeeze(),
                                  np.ones(100) / 100, mode = "valid")
 
-    ax[2].plot(smooth_rewards)
+    ax[2].plot(total_rewards)
     ax[2].set_title("Reward")
     plt.tight_layout()
