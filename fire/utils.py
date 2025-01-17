@@ -11,7 +11,7 @@ class ReplayBuffer:
                  state_dim,
                  action_dim,
                  special_buffer_dim = None,
-                 capacity = int(1e4),
+                 capacity = int(1e6),
                  min_capacity = 1000):
         self.capacity = capacity
         if min_capacity < 1:
@@ -37,7 +37,9 @@ class ReplayBuffer:
             self.pos = 0
 
         self.state_buffer[self.pos] = state
-        self.action_buffer[self.pos] = action.detach().cpu().numpy()
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().numpy()
+        self.action_buffer[self.pos] = action
         self.reward_buffer[self.pos] = reward
         self.next_state_buffer[self.pos] = next_state
         self.done_buffer[self.pos] = done

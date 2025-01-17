@@ -339,7 +339,7 @@ if __name__ == "__main__":
     episodes_per_epoch = 8
     steps_per_epoch = 200
     traj_snapshot_every = n_epochs // 10
-    smoothing_num = max(1, int(n_epochs / 10))
+    smoothing_num = max(1, int(n_epochs / 5))
     smooth_kernel = np.ones(smoothing_num) / smoothing_num
 
     losses, trajs, dists = continuous_metra(n_epochs = n_epochs,
