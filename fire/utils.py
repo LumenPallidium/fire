@@ -109,6 +109,29 @@ class SparseLinear(torch.nn.Module):
     def forward(self, x):
         return torch.nn.functional.linear(x, self.weight, self.bias)
     
+class SparseMLP(torch.nn.Module):
+    def __init__(self,
+                 dims,
+                 sparsity = 0.9,
+                 activation = torch.nn.LeakyReLU()):
+        super().__init__()
+        self.in_dim = dims[0]
+        self.out_dim = dims[-1]
+        self.sparsity = sparsity
+
+        self.layers = []
+        for i in range(1, len(dims)):
+            self.layers.append(SparseLinear(dims[i-1], dims[i], sparsity))
+            if i < len(dims) - 1:
+                self.layers.append(activation)
+
+        self.layers = torch.nn.ModuleList(self.layers)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
 class NormedSparseMLP(torch.nn.Module):
     def __init__(self,
                  dims,
