@@ -63,6 +63,7 @@ class DeepMapLeaner(torch.nn.Module):
                  hidden_dim_obs = 512,
                  hidden_dim_act = 512,
                  activation = torch.nn.LeakyReLU(),
+                 autoencode = True,
                  lambda_v = 1,
                  eps = 0.1):
         super().__init__()
@@ -76,11 +77,16 @@ class DeepMapLeaner(torch.nn.Module):
         self.hidden_dim_act = hidden_dim_act
         self.lambda_v = lambda_v
         self.eps = eps
+        self.autoencode = autoencode
 
         self.state_embed = SparseMLP([state_dim] + hidden_dim_obs,
                                      activation=activation)
         self.action_embed = SparseMLP([action_dim] + hidden_dim_act,
                                       activation=activation)
+        if self.autoencode:
+            self.action_decoder = SparseMLP(hidden_dim_act + [action_dim],
+                                            activation=activation)
+        
 
     def forward(self, state, action):
         state_embed = self.state_embed(state)
@@ -107,20 +113,23 @@ class DeepMapLeaner(torch.nn.Module):
         # this regularizes the action embedding
         loss_action -= self.lambda_v * torch.clamp(1 - torch.norm(action_embed),
                                                    max = self.eps)
-        return loss_state, loss_action
+        if self.autoencode:
+            action_embed_ = action_embed.detach()
+            action_embed_.requires_grad_(True)
+            action_hat = self.action_decoder(action_embed_)
+            loss_decode = mse_loss(action_hat, action)
+        else:
+            loss_decode = torch.tensor(0.0,
+                                       device = obs.device)
+        return loss_state, loss_action, loss_decode
     
-    def step_to_goal(self, curr_obs, goal_obs, desired_loss = 0.9, max_steps = 200):
-        curr_embed = self.state_embed(curr_obs)
-        goal_embed = self.state_embed(goal_obs)
-
-        diff = goal_embed - curr_embed
+    def _gradient_ascent_action(self, curr_obs, diff, desired_loss = 0.9, max_steps = 200):
         # perform gradient descent on the action embedding
         action = torch.randn(self.action_dim,
                              device = curr_obs.device)
         action.requires_grad_(True)
         loss = -1
         step = 0
-        #TODO this is slow, add an autoencoder to speed up
         while (loss < desired_loss) and (step < max_steps):
             action_embed = self.action_embed(action)
             loss = torch.cosine_similarity(action_embed, diff.detach(),
@@ -134,6 +143,22 @@ class DeepMapLeaner(torch.nn.Module):
             step += 1
             
         action = action.detach().clone()
+        return action
+    
+    def step_to_goal(self, curr_obs, goal_obs, **kwargs):
+        curr_embed = self.state_embed(curr_obs)
+        goal_embed = self.state_embed(goal_obs)
+
+        diff = goal_embed - curr_embed
+        if self.autoencode:
+            action = self.action_decoder(diff,
+                                         **kwargs)
+        else:
+            action = self._gradient_ascent_action(curr_obs,
+                                                  diff,
+                                                  **kwargs)
+
+
         action /= torch.norm(action)
         return action
             
@@ -160,7 +185,7 @@ if __name__ == "__main__":
     n_epochs = 100
     eps_per_epoch = 30
     steps_per_epoch = 8 * eps_per_epoch
-    batch_size = 128
+    batch_size = 256
     episode_count = 0
 
     errors = []
@@ -172,6 +197,8 @@ if __name__ == "__main__":
                                  lr = 0.00001)
     optimizer_action = torch.optim.Adam(deep_map_learner.action_embed.parameters(),
                                         lr = 0.0001)
+    optimizer_decoder = torch.optim.Adam(deep_map_learner.action_decoder.parameters(),
+                                        lr = 0.001)
 
     for epoch in range(n_epochs):
         for _ in range(eps_per_epoch):
@@ -204,19 +231,24 @@ if __name__ == "__main__":
             pred_error = map_learner.manual_update(states[:, 0, :],
                                                    actions[:, 0, :],
                                                    next_states[:, 0, :])
-            loss_state, loss_action = deep_map_learner.get_loss(states, actions, next_states)
+            loss_state, loss_action, loss_decode = deep_map_learner.get_loss(states,
+                                                                             actions,
+                                                                             next_states)
 
             optimizer_state.zero_grad()
             optimizer_action.zero_grad()
+            optimizer_decoder.zero_grad()
             loss_state.backward(retain_graph = True)
             loss_action.backward()
+            loss_decode.backward()
             optimizer_state.step()
             optimizer_action.step()
+            optimizer_decoder.step()
 
             errors.append(pred_error.norm().item())
-            errors_deep.append(loss_state.item() + loss_action.item())
+            errors_deep.append(loss_state.item() + loss_decode.item())
 
-            pbar.set_description(f"Epoch: {epoch}| Error: {errors[-1]:.2f}| Traj {traj_length}")
+            pbar.set_description(f"Epoch: {epoch}| Error: {errors[-1]:.2f}| AE: {loss_decode.item():.2f}")
             pbar.update(1)
 
     pbar.close()
@@ -294,3 +326,6 @@ if __name__ == "__main__":
                     label = name,
                     c = colors, cmap = cmap)
     ax[1].scatter(goal_xy[0], goal_xy[1], label = "Goal")
+
+    plt.tight_layout()
+    fig.savefig("tmp/map_learner.png", dpi = 300)

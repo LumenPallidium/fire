@@ -504,3 +504,4 @@ if __name__ == "__main__":
     ax[2].plot(total_rewards)
     ax[2].set_title("Reward")
     plt.tight_layout()
+    fig.savefig("tmp/sac.png")
