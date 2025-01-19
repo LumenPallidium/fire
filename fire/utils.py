@@ -3,6 +3,30 @@ import math
 import numpy as np
 from copy import deepcopy
 
+def sample_geometric(gamma, n = 1, max_len = 100):
+    dist = torch.distributions.Geometric(probs = 1 - gamma)
+    sample = dist.sample((n,))
+    sample = torch.clamp(sample, 0, max_len)
+    if n == 1:
+        sample = sample.item()
+    return sample
+
+def find_episode_boundaries(episodes):
+    """
+    Find the boundaries of episodes in a batch of episodes, which has
+    shape (batch, trajectory length).
+    """
+    # get differences between episode indices
+    diff = episodes[:, 1:] != episodes[:, :-1]
+    first_diff = diff.argmax(axis=1)
+    
+    # spots where there may be a change
+    has_transition = diff.any(axis=1)
+    # for each element in the batch, the episode length
+    valid_lengths = np.where(has_transition, first_diff + 1, episodes.shape[1])
+    
+    return valid_lengths
+
 class ReplayBuffer:
     """
     A basic replay buffer.
@@ -11,18 +35,21 @@ class ReplayBuffer:
                  state_dim,
                  action_dim,
                  special_buffer_dim = None,
+                 return_trajectory = False,
                  capacity = int(1e6),
                  min_capacity = 1000):
         self.capacity = capacity
         if min_capacity < 1:
             min_capacity = int(capacity * min_capacity)
         self.min_capacity = min_capacity
+        self.return_trajectory = return_trajectory
 
         self.state_buffer = np.zeros((capacity, state_dim), dtype = np.float32)
         self.action_buffer = np.zeros((capacity, action_dim), dtype = np.float32)
         self.reward_buffer = np.zeros((capacity, 1), dtype = np.float32)
         self.next_state_buffer = np.zeros((capacity, state_dim), dtype = np.float32)
         self.done_buffer = np.zeros((capacity, 1), dtype = np.float32)
+        self.episode_buffer = np.zeros((capacity, 1), dtype = np.int32)
 
         self.special_buffer = None
         if special_buffer_dim is not None:
@@ -31,7 +58,8 @@ class ReplayBuffer:
         self.pos = 0
         self.total = 0
 
-    def push(self, state, action, next_state, done, reward = torch.nan, special = None):
+    def push(self, state, action, next_state, done,
+             episode = None, reward = torch.nan, special = None):
         # reset the position, making this fifo
         if self.pos >= self.capacity:
             self.pos = 0
@@ -44,19 +72,41 @@ class ReplayBuffer:
         self.next_state_buffer[self.pos] = next_state
         self.done_buffer[self.pos] = done
 
+        if episode is not None:
+            self.episode_buffer[self.pos] = episode
+
         if (self.special_buffer is not None) and (special is not None):
             self.special_buffer[self.pos] = special.detach().cpu().numpy()
 
         self.pos += 1
         self.total += 1
 
-    def sample(self, batch_size = 256, device = None):
+    def sample(self,
+               gamma = 0.99,
+               max_traj_length = 100,
+               batch_size = 256, device = None):
+        if self.return_trajectory:
+            traj_length = sample_geometric(gamma,
+                                           max_len = max_traj_length)
+            traj_length = max(int(traj_length), 1)
+        else:
+            traj_length = 0
         if self.total < batch_size:
             batch_size = self.total
         if self.total < self.capacity:
-            idx = np.random.randint(0, self.total, batch_size)
+            idx = np.random.randint(0, self.total - traj_length,
+                                    batch_size)
         else:
-            idx = np.random.randint(0, self.capacity, batch_size)
+            idx = np.random.randint(0, self.capacity - traj_length,
+                                    batch_size)
+        if self.return_trajectory:
+            # if our sample extends multiple episodes, trim it
+            if traj_length != 1:
+                idx_tmp = idx[:, None] + np.arange(traj_length)
+                # clip index if it spans two episodes
+                episodes = self.episode_buffer[idx_tmp, 0]
+                traj_length = np.min(find_episode_boundaries(episodes))
+            idx = idx[:, None] + np.arange(traj_length)
         return (torch.tensor(self.state_buffer[idx], device = device),
                 torch.tensor(self.action_buffer[idx], device = device),
                 torch.tensor(self.reward_buffer[idx], device = device),
