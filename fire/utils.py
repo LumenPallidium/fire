@@ -143,6 +143,26 @@ def custom_sparse_init(tensor, sparsity = 0.1):
         mask = torch.rand_like(tensor) > sparsity
         tensor.data *= mask
 
+def symlog(x):
+    return torch.sign(x) * torch.log(torch.abs(x) + 1)
+
+def symexp(x):
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+
+class SymLog(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return symlog(x)
+    
+class SymExp(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return symexp(x)
+
 class SparseLinear(torch.nn.Module):
     def __init__(self, in_features, out_features, sparsity = 0.9):
         super().__init__()
@@ -162,7 +182,7 @@ class SparseLinear(torch.nn.Module):
 class SparseMLP(torch.nn.Module):
     def __init__(self,
                  dims,
-                 sparsity = 0.9,
+                 sparsity = 0.6,
                  activation = torch.nn.LeakyReLU()):
         super().__init__()
         self.in_dim = dims[0]

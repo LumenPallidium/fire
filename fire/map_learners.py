@@ -1,6 +1,6 @@
 import torch
-from torch.nn.functional import mse_loss
-from utils import SparseMLP
+from torch.nn.functional import mse_loss, huber_loss
+from utils import SparseMLP, SymLog
 
 class LinearMapLearner(torch.nn.Module):
     """
@@ -46,7 +46,7 @@ class LinearMapLearner(torch.nn.Module):
                                                   dim = 0).unsqueeze(0)
         return pred_error
     
-    def step_to_goal(self, curr_obs, goal_obs):
+    def step_to_goal(self, curr_obs, goal_obs, **kwargs):
         curr_embed = self.state_embed(curr_obs)
         goal_embed = self.state_embed(goal_obs)
 
@@ -62,7 +62,7 @@ class DeepMapLeaner(torch.nn.Module):
     def __init__(self, state_dim, action_dim,
                  hidden_dim_obs = 512,
                  hidden_dim_act = 512,
-                 activation = torch.nn.LeakyReLU(),
+                 activation = SymLog(),
                  autoencode = True,
                  lambda_v = 1,
                  eps = 0.1):
@@ -84,7 +84,8 @@ class DeepMapLeaner(torch.nn.Module):
         self.action_embed = SparseMLP([action_dim] + hidden_dim_act,
                                       activation=activation)
         if self.autoencode:
-            self.action_decoder = SparseMLP(hidden_dim_act + [action_dim],
+            hidden_dim_act_inv = hidden_dim_act[::-1]
+            self.action_decoder = SparseMLP(hidden_dim_act_inv + [action_dim],
                                             activation=activation)
         
 
@@ -107,17 +108,17 @@ class DeepMapLeaner(torch.nn.Module):
             loss_state = mse_loss(state_embed, (next_state - cumulative_action).detach())
             loss_action = mse_loss(cumulative_action, (next_state - state_embed).detach())
         else:
-            # can't mix up the gradients - treat targets as constant
             loss_state = mse_loss(state_embed, (next_state - action_embed).detach())
             loss_action = mse_loss(action_embed, (next_state - state_embed).detach())
         # this regularizes the action embedding
-        loss_action -= self.lambda_v * torch.clamp(1 - torch.norm(action_embed),
-                                                   max = self.eps)
+        loss_action -= self.lambda_v * torch.clamp(1 - torch.norm(action_embed,
+                                                                  dim = -1),
+                                                   max = self.eps).mean()
         if self.autoencode:
             action_embed_ = action_embed.detach()
-            action_embed_.requires_grad_(True)
             action_hat = self.action_decoder(action_embed_)
-            loss_decode = mse_loss(action_hat, action)
+            action_hat = torch.tanh(action_hat)
+            loss_decode = huber_loss(action_hat, action)
         else:
             loss_decode = torch.tensor(0.0,
                                        device = obs.device)
@@ -146,21 +147,22 @@ class DeepMapLeaner(torch.nn.Module):
         return action
     
     def step_to_goal(self, curr_obs, goal_obs, **kwargs):
-        curr_embed = self.state_embed(curr_obs)
-        goal_embed = self.state_embed(goal_obs)
+        with torch.no_grad():
+            curr_embed = self.state_embed(curr_obs)
+            goal_embed = self.state_embed(goal_obs)
 
-        diff = goal_embed - curr_embed
+            diff = goal_embed - curr_embed
+        diff /= torch.norm(diff)
         if self.autoencode:
-            action = self.action_decoder(diff,
-                                         **kwargs)
+            with torch.no_grad():
+                action = self.action_decoder(diff)
         else:
             action = self._gradient_ascent_action(curr_obs,
                                                   diff,
                                                   **kwargs)
 
 
-        action /= torch.norm(action)
-        return action
+        return action.clamp(-1, 1)
             
 
 if __name__ == "__main__":
@@ -171,7 +173,8 @@ if __name__ == "__main__":
     from gymnasium.wrappers import RecordVideo
     from utils import ReplayBuffer
     env_name = "Ant-v5"
-    env = make(env_name)
+    env = make(env_name,
+               exclude_current_positions_from_observation=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -179,8 +182,8 @@ if __name__ == "__main__":
 
     map_learner = LinearMapLearner(obs_dim + 1, action_dim).to(device)
     deep_map_learner = DeepMapLeaner(obs_dim + 1, action_dim,
-                                     [256, 256], [256, 256],
-                                     activation = torch.nn.LeakyReLU()).to(device)
+                                     [256, 128, 64, 32], [256, 128, 64, 32],
+                                     activation = SymLog()).to(device)
 
     n_epochs = 100
     eps_per_epoch = 30
@@ -254,12 +257,15 @@ if __name__ == "__main__":
     pbar.close()
 
     # get body to x,y position of 10, 10
-    goal_obs = torch.zeros(obs_dim + 1).to(device)
-    goal_obs[0] = 0.3
     goal_xy = [10, 10]
-
+    goal_obs = torch.zeros(obs_dim + 1).to(device)
+    goal_obs[0] = goal_xy[0]
+    goal_obs[1] = goal_xy[1]
+    goal_obs[2] = 0.3
+    
     env = make(env_name,
                render_mode="rgb_array",
+               exclude_current_positions_from_observation = False,
                max_episode_steps=5000)
 
     all_xys = []
@@ -282,9 +288,6 @@ if __name__ == "__main__":
                                 device = device)
             if vec_d.norm() < 0.5:
                 break
-            goal_angle = torch.atan2(vec_d[1], vec_d[0])
-            goal_obs[2] = torch.cos(goal_angle)
-            goal_obs[3] = torch.sin(goal_angle)
 
             obs = torch.tensor(obs, dtype = torch.float32, device = device)
             obs = torch.cat([obs,
