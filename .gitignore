@@ -185,3 +185,4 @@ cython_debug/
 # Mac Specific Files
 *.DS_Store
 
+/fire/map_learner_test.py

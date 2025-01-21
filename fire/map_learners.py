@@ -58,13 +58,14 @@ class LinearMapLearner(torch.nn.Module):
 
         return action.clamp(-1, 1)
     
-class DeepMapLeaner(torch.nn.Module):
+class DeepMapLearner(torch.nn.Module):
     def __init__(self, state_dim, action_dim,
                  hidden_dim_obs = 512,
                  hidden_dim_act = 512,
                  activation = SymLog(),
                  autoencode = True,
                  lambda_v = 1,
+                 lambda_area = 1,
                  eps = 0.1):
         super().__init__()
         self.state_dim = state_dim
@@ -76,6 +77,7 @@ class DeepMapLeaner(torch.nn.Module):
         self.hidden_dim_obs = hidden_dim_obs
         self.hidden_dim_act = hidden_dim_act
         self.lambda_v = lambda_v
+        self.lambda_area = lambda_area
         self.eps = eps
         self.autoencode = autoencode
 
@@ -107,9 +109,38 @@ class DeepMapLeaner(torch.nn.Module):
             # can't mix up the gradients - treat targets as constant
             loss_state = mse_loss(state_embed, (next_state - cumulative_action).detach())
             loss_action = mse_loss(cumulative_action, (next_state - state_embed).detach())
+
+            # vol_state = torch.stack([state_embed, cumulative_action.detach()], dim = -1)
+            # vol_state = torch.einsum("bid,bjd->bij",
+            #                          vol_state,
+            #                          vol_state).det()
+            # vol_state = (vol_state + 1e-6).sqrt().mean()
+            vol_action = torch.stack([(next_state - state_embed).detach(),
+                                      cumulative_action], dim = -1)
+            grammian = torch.einsum("bid,bjd->bij",
+                                      vol_action,
+                                      vol_action).det()
+            vol_loss = (grammian - 1).pow(2).mean()
+
+            # loss_state += self.lambda_area * vol_state
+            loss_action += self.lambda_area * vol_loss
         else:
             loss_state = mse_loss(state_embed, (next_state - action_embed).detach())
             loss_action = mse_loss(action_embed, (next_state - state_embed).detach())
+
+            action_norm = torch.norm(action_embed, dim = -1) + 1e-3
+            state_norm = torch.norm((next_state - state_embed), dim = -1) + 1e-3
+
+            vol_action = torch.stack([(next_state - state_embed).detach() / state_norm[:, None].detach(),
+                                      action_embed / action_norm[:, None].detach()], dim = -1)
+            grammian = torch.einsum("bid,bjd->bij",
+                                      vol_action,
+                                      vol_action).det()
+            vol_loss = (grammian.abs() - 0.2).pow(2).clamp(0.2).mean()
+
+            # loss_state += self.lambda_area * vol_state
+            loss_action += self.lambda_area * vol_loss
+
         # this regularizes the action embedding
         loss_action -= self.lambda_v * torch.clamp(1 - torch.norm(action_embed,
                                                                   dim = -1),
@@ -181,7 +212,7 @@ if __name__ == "__main__":
     target_entropy = -action_dim
 
     map_learner = LinearMapLearner(obs_dim + 1, action_dim).to(device)
-    deep_map_learner = DeepMapLeaner(obs_dim + 1, action_dim,
+    deep_map_learner = DeepMapLearner(obs_dim + 1, action_dim,
                                      [256, 128, 64, 32], [256, 128, 64, 32],
                                      activation = SymLog()).to(device)
 
@@ -248,7 +279,7 @@ if __name__ == "__main__":
             optimizer_action.step()
             optimizer_decoder.step()
 
-            errors.append(pred_error.norm().item())
+            errors.append(pred_error.norm(dim = -1).mean().item())
             errors_deep.append(loss_state.item() + loss_decode.item())
 
             pbar.set_description(f"Epoch: {epoch}| Error: {errors[-1]:.2f}| AE: {loss_decode.item():.2f}")
