@@ -1,6 +1,15 @@
 import torch
 from torch.nn.functional import mse_loss, huber_loss
-from utils import SparseMLP, SymLog
+from utils import SparseMLP, SymLog, log_barrier_loss
+
+
+def volume_loss(x, y, target_volume):
+    vol_action = torch.stack([x, y], dim = -1)
+    grammian = torch.einsum("bid,bjd->bij",
+                            vol_action,
+                            vol_action).det()
+    vol_loss = log_barrier_loss(grammian.abs().sqrt(), target_volume).mean()
+    return vol_loss
 
 class LinearMapLearner(torch.nn.Module):
     """
@@ -62,11 +71,11 @@ class DeepMapLearner(torch.nn.Module):
     def __init__(self, state_dim, action_dim,
                  hidden_dim_obs = 512,
                  hidden_dim_act = 512,
-                 activation = SymLog(),
+                 activation = torch.nn.Tanh(),
                  autoencode = True,
                  lambda_v = 1,
                  lambda_area = 1,
-                 eps = 0.1):
+                 eps = 2):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -76,6 +85,8 @@ class DeepMapLearner(torch.nn.Module):
             hidden_dim_act = [hidden_dim_act]
         self.hidden_dim_obs = hidden_dim_obs
         self.hidden_dim_act = hidden_dim_act
+        assert hidden_dim_act[-1] == hidden_dim_obs[-1], "Last hidden dim must match"
+        self.embed_dim = hidden_dim_obs[-1]
         self.lambda_v = lambda_v
         self.lambda_area = lambda_area
         self.eps = eps
@@ -85,6 +96,7 @@ class DeepMapLearner(torch.nn.Module):
                                      activation=activation)
         self.action_embed = SparseMLP([action_dim] + hidden_dim_act,
                                       activation=activation)
+        self.tanh = torch.nn.Identity()
         if self.autoencode:
             hidden_dim_act_inv = hidden_dim_act[::-1]
             self.action_decoder = SparseMLP(hidden_dim_act_inv + [action_dim],
@@ -110,46 +122,38 @@ class DeepMapLearner(torch.nn.Module):
             loss_state = mse_loss(state_embed, (next_state - cumulative_action).detach())
             loss_action = mse_loss(cumulative_action, (next_state - state_embed).detach())
 
-            # vol_state = torch.stack([state_embed, cumulative_action.detach()], dim = -1)
-            # vol_state = torch.einsum("bid,bjd->bij",
-            #                          vol_state,
-            #                          vol_state).det()
-            # vol_state = (vol_state + 1e-6).sqrt().mean()
-            vol_action = torch.stack([(next_state - state_embed).detach(),
-                                      cumulative_action], dim = -1)
-            grammian = torch.einsum("bid,bjd->bij",
-                                      vol_action,
-                                      vol_action).det()
-            vol_loss = (grammian - 1).pow(2).mean()
-
-            # loss_state += self.lambda_area * vol_state
-            loss_action += self.lambda_area * vol_loss
         else:
-            loss_state = mse_loss(state_embed, (next_state - action_embed).detach())
-            loss_action = mse_loss(action_embed, (next_state - state_embed).detach())
+            loss_state = mse_loss(state_embed, next_state - action_embed.detach())
+            loss_action = mse_loss(action_embed, next_state - state_embed.detach())
 
-            action_norm = torch.norm(action_embed, dim = -1) + 1e-3
-            state_norm = torch.norm((next_state - state_embed), dim = -1) + 1e-3
+            if self.lambda_area != 0:
+                with torch.no_grad():
+                    act_denom = (torch.norm(action, dim = -1) + 1e-6)
+                    real_scale = torch.norm(next_obs - obs, dim = -1) / act_denom
+                vol_loss_action = mse_loss(action_embed.norm(dim = -1), real_scale)
+                vol_loss_state = mse_loss((next_state - state_embed).norm(dim = -1),
+                                          real_scale)
+                loss_action += self.lambda_area * vol_loss_action
+                loss_state += self.lambda_area * vol_loss_state
 
-            vol_action = torch.stack([(next_state - state_embed).detach() / state_norm[:, None].detach(),
-                                      action_embed / action_norm[:, None].detach()], dim = -1)
-            grammian = torch.einsum("bid,bjd->bij",
-                                      vol_action,
-                                      vol_action).det()
-            vol_loss = (grammian.abs() - 0.2).pow(2).clamp(0.2).mean()
-
-            # loss_state += self.lambda_area * vol_state
-            loss_action += self.lambda_area * vol_loss
-
-        # this regularizes the action embedding
-        loss_action -= self.lambda_v * torch.clamp(1 - torch.norm(action_embed,
-                                                                  dim = -1),
-                                                   max = self.eps).mean()
+        # this regularizes the embeddings
+        loss_barrier_action = log_barrier_loss(action_embed.norm(dim = -1),
+                                               1, margin = self.eps).mean()
+        loss_barrier_state = log_barrier_loss(state_embed.norm(dim = -1),
+                                              1, margin = self.eps).mean()
+        if not torch.isnan(loss_barrier_action):
+            loss_action += self.lambda_v * loss_barrier_action
+        if not torch.isnan(loss_barrier_state):
+            loss_state += self.lambda_v * loss_barrier_state
         if self.autoencode:
             action_embed_ = action_embed.detach()
             action_hat = self.action_decoder(action_embed_)
-            action_hat = torch.tanh(action_hat)
-            loss_decode = huber_loss(action_hat, action)
+            action_hat = self.tanh(action_hat)
+            # weight magnitude and alignment separately
+            magnitude_hat, magnitude = action_hat.norm(dim = -1), action_embed_.norm(dim = -1)
+            mag_loss = mse_loss(magnitude_hat, magnitude)
+            align_loss = -(action_hat * action).sum(dim = -1) / (magnitude_hat * magnitude)[:, None]
+            loss_decode = mag_loss + 2 * align_loss.mean()
         else:
             loss_decode = torch.tensor(0.0,
                                        device = obs.device)
@@ -177,25 +181,90 @@ class DeepMapLearner(torch.nn.Module):
         action = action.detach().clone()
         return action
     
+    def step_to_goal(self, curr_obs, goal_obs, scale = None, **kwargs):
+        with torch.no_grad():
+            curr_embed = self.state_embed(curr_obs)
+            goal_embed = self.state_embed(goal_obs)
+
+            diff = goal_embed - curr_embed
+            if scale is not None:
+                diff = (diff / diff.norm(dim = -1).unsqueeze(-1)) * scale
+        if self.autoencode:
+            with torch.no_grad():
+                action = self.action_decoder(diff)
+                action = self.tanh(action)
+        else:
+            action = self._gradient_ascent_action(curr_obs,
+                                                  diff,
+                                                  **kwargs)
+            action = action.clamp(-1, 1)
+
+        return action
+    
+class IntrinsicMapLearner(torch.nn.Module):
+    def __init__(self, state_dim, action_dim,
+                 hidden_dim_obs = 512,
+                 hidden_dim_act = 512,
+                 activation = SymLog(),
+                 action_std = 0.1,
+                 eps = 1):
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        if isinstance(hidden_dim_obs, int):
+            hidden_dim_obs = [hidden_dim_obs]
+        if isinstance(hidden_dim_act, int):
+            hidden_dim_act = [hidden_dim_act]
+        self.hidden_dim_obs = hidden_dim_obs
+        self.hidden_dim_act = hidden_dim_act
+        assert hidden_dim_act[0] == hidden_dim_obs[-1], "Last hidden dim must match"
+        self.embed_dim = hidden_dim_obs[-1]
+        self.action_std = action_std
+        self.eps = eps
+
+        self.state_embed = SparseMLP([state_dim] + hidden_dim_obs,
+                                     activation=activation)
+
+        self.action_decoder = SparseMLP(hidden_dim_act + [action_dim],
+                                        activation=activation)
+        self.tanh = torch.nn.Identity()
+        
+    def forward(self, action_embed):
+        return self.tanh(self.action_decoder(action_embed))
+    
+    def sample_actions(self, batch_size, device = None):
+        actions_embed = torch.randn(batch_size, self.embed_dim,
+                                    device = device) * self.action_std
+        actions = self.forward(actions_embed)
+        return actions, actions_embed
+    
+    def get_loss(self, obs, action_embed, next_obs):
+        state_embed = self.state_embed(obs)
+        with torch.no_grad():
+            next_state = self.state_embed(next_obs)
+        loss = mse_loss(next_state - state_embed, action_embed.detach())
+
+        # TODO : loss on the decoder to maximize covariance with state changes
+        # barrier loss for now
+        action = self.tanh(self.action_decoder(action_embed))
+        loss_a = log_barrier_loss(action.norm(dim = -1),
+                                  1, margin = self.eps).mean()
+
+        return loss, loss_a
+    
     def step_to_goal(self, curr_obs, goal_obs, **kwargs):
         with torch.no_grad():
             curr_embed = self.state_embed(curr_obs)
             goal_embed = self.state_embed(goal_obs)
 
             diff = goal_embed - curr_embed
-        diff /= torch.norm(diff)
-        if self.autoencode:
-            with torch.no_grad():
-                action = self.action_decoder(diff)
-        else:
-            action = self._gradient_ascent_action(curr_obs,
-                                                  diff,
-                                                  **kwargs)
+            diff = (diff / diff.norm(dim = -1).unsqueeze(-1)) * self.action_std
 
+            action = self.action_decoder(diff)
+            action = self.tanh(action)
 
-        return action.clamp(-1, 1)
+        return action
             
-
 if __name__ == "__main__":
     from gymnasium import make
     from tqdm import tqdm

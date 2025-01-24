@@ -3,6 +3,16 @@ import math
 import numpy as np
 from copy import deepcopy
 
+def log_barrier_loss(x, target, margin = 0.01, margin_fraction = None, epsilon = 1e-5):
+    if margin is None:
+        upper = target * (1 + margin_fraction)
+        lower = target * (1 - margin_fraction)
+    else:
+        upper = target + margin
+        lower = target - margin
+    return -(torch.log(epsilon + x - lower) + 
+             torch.log(epsilon + upper - x))
+
 def sample_geometric(gamma, n = 1, max_len = 100):
     dist = torch.distributions.Geometric(probs = 1 - gamma)
     sample = dist.sample((n,))
