@@ -1,6 +1,6 @@
 import torch
 from torch.nn.functional import mse_loss, huber_loss
-from utils import SparseMLP, SymLog, log_barrier_loss
+from utils import SparseMLP, SymLog, log_barrier_loss, ortho_loss
 
 
 def volume_loss(x, y, target_volume):
@@ -137,14 +137,17 @@ class DeepMapLearner(torch.nn.Module):
                 loss_state += self.lambda_area * vol_loss_state
 
         # this regularizes the embeddings
-        loss_barrier_action = log_barrier_loss(action_embed.norm(dim = -1),
-                                               1, margin = self.eps).mean()
-        loss_barrier_state = log_barrier_loss(state_embed.norm(dim = -1),
-                                              1, margin = self.eps).mean()
-        if not torch.isnan(loss_barrier_action):
-            loss_action += self.lambda_v * loss_barrier_action
-        if not torch.isnan(loss_barrier_state):
-            loss_state += self.lambda_v * loss_barrier_state
+        # loss_barrier_action = log_barrier_loss(action_embed.norm(dim = -1),
+        #                                        1, margin = self.eps).mean()
+        # loss_barrier_state = log_barrier_loss(state_embed.norm(dim = -1),
+        #                                       1, margin = self.eps).mean()
+        ortho_loss_action = ortho_loss(action_embed)
+        ortho_loss_state = ortho_loss(state_embed)
+
+        if not torch.isnan(ortho_loss_action):#loss_barrier_action):
+            loss_action += self.lambda_v * ortho_loss_action#loss_barrier_action
+        if not torch.isnan(ortho_loss_state):#loss_barrier_state):
+            loss_state += self.lambda_v * ortho_loss_state#loss_barrier_state
         if self.autoencode:
             action_embed_ = action_embed.detach()
             action_hat = self.action_decoder(action_embed_)

@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 from gymnasium import make
@@ -10,11 +11,21 @@ class DiscreteSkillSpace(torch.nn.Module):
         super().__init__()
         self.dim = dim
 
-    def sample(self, n_samples = 1):
+    def sample(self, n_samples = 1, onehot = True):
         x = torch.randint(0, self.dim, (n_samples,))
         if n_samples == 1:
             x = x.squeeze(0)
+        if onehot:
+            x = torch.nn.functional.one_hot(x,
+                                            num_classes = self.dim).float()
         return x
+    
+    def enumerate(self, onehot = True):
+        if onehot:
+            skills = torch.eye(self.dim).float()
+        else:
+            skills = torch.arange(self.dim).float()
+        return skills
     
     def __len__(self):
         return self.dim
@@ -36,6 +47,15 @@ class ContinuousSkillSpace(torch.nn.Module):
         if n_samples == 1:
             x = x.squeeze(0)
         return x
+    
+    def enumerate(self):
+        square = torch.randn(self.dim,
+                             self.dim)
+        q, _ = torch.qr(square)
+        if self.von_mises:
+            # make orthonormal
+            q /= q.norm(p = 2, dim = -1, keepdim = True)
+        return q
     
     def __len__(self):
         return self.dim
@@ -331,14 +351,58 @@ def continuous_csf(n_epochs = 100,
                        f"tmp/sac_model_{epoch}.pt")
     return np.array(losses), xy_trajs
 
+def skill_video(checkpoint_dir = "tmp/",
+                env_name = "Ant-v5",
+                skill_dim = 2):
+    from gymnasium.wrappers import RecordVideo
+    
+    paths = [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir)]
+    # filter to policy and get max epoch
+    paths = [f for f in paths if "policy" in f]
+    paths = sorted(paths, key = lambda x: int(x.split("_")[-1].split(".")[0]))
+    path = paths[-1]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    env = make(env_name,
+               render_mode="rgb_array",
+               max_episode_steps=5000)
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+
+    env = RecordVideo(env,
+                      video_folder="tmp/",
+                      episode_trigger=lambda x: True,
+                      name_prefix=f"skill_rl_")
+
+    policy = SkillConditionedPolicy(obs_dim, action_dim, skill_dim = skill_dim,
+                                    variance = True).to(device)
+    policy.load_state_dict(torch.load(path))
+
+    skill_space = ContinuousSkillSpace(skill_dim).to(device)
+    skills = skill_space.enumerate().to(device)
+
+    for skill in tqdm(skills):
+        obs, _ = env.reset()
+        done = False
+        while not done:
+            action, _ = policy.stochastic_sample(torch.tensor(obs,
+                                                 device = device,
+                                                 dtype = torch.float32),
+                                                 skill = skill)
+            obs, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy())
+            done = (terminated or truncated)
+    env.close()
+
+
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import os
     os.makedirs("tmp", exist_ok = True)
-    n_epochs = 400
+    n_epochs = 3000
     episodes_per_epoch = 8
     steps_per_epoch = 200
     traj_snapshot_every = n_epochs // 10
+    save_model_every = n_epochs // 100
     smoothing_num = max(1, int(n_epochs / 5))
     smooth_kernel = np.ones(smoothing_num) / smoothing_num
 
@@ -347,6 +411,7 @@ if __name__ == "__main__":
                                             buffer_capacity = int(1e6),
                                             episodes_per_epoch = episodes_per_epoch,
                                             traj_snapshot_every = traj_snapshot_every,
+                                            save_model_every = save_model_every,
                                             batch_size = 256)
 
     fig, ax = plt.subplots(1, 3, figsize = (12, 6))

@@ -3,6 +3,12 @@ import math
 import numpy as np
 from copy import deepcopy
 
+def ortho_loss(x, target_diag = 1):
+    xx = torch.einsum("...i,...j->...ij",
+                      x, x)
+    xx -= target_diag * torch.eye(xx.shape[-1], device = xx.device)
+    return (xx**2).mean()
+
 def log_barrier_loss(x, target, margin = 0.01, margin_fraction = None, epsilon = 1e-5):
     if margin is None:
         upper = target * (1 + margin_fraction)
