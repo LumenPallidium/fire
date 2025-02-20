@@ -1,5 +1,6 @@
 import torch
-from torch.nn.functional import mse_loss, huber_loss
+import numpy as np
+from torch.nn.functional import mse_loss, huber_loss, relu
 from utils import SparseMLP, SymLog, log_barrier_loss, ortho_loss
 
 
@@ -75,6 +76,7 @@ class DeepMapLearner(torch.nn.Module):
                  autoencode = True,
                  lambda_v = 1,
                  lambda_area = 1,
+                 lambda_t = 1,
                  eps = 2):
         super().__init__()
         self.state_dim = state_dim
@@ -89,6 +91,7 @@ class DeepMapLearner(torch.nn.Module):
         self.embed_dim = hidden_dim_obs[-1]
         self.lambda_v = lambda_v
         self.lambda_area = lambda_area
+        self.lambda_t = lambda_t
         self.eps = eps
         self.autoencode = autoencode
 
@@ -114,6 +117,8 @@ class DeepMapLearner(torch.nn.Module):
         with torch.no_grad():
             next_state = self.state_embed(next_obs)
         if (len(obs.shape) == 3) and (obs.shape[1] > 1):
+            # note this is d(s1, s3) not d(s1, s2) (for triangle inequality)
+            state_diffs = next_state[:, 1:, :] - state_embed[:, :-1, :]
             # multistep prediction
             cumulative_action = action_embed.sum(dim = 1)
             state_embed = state_embed[:, 0, :]
@@ -121,6 +126,14 @@ class DeepMapLearner(torch.nn.Module):
             # can't mix up the gradients - treat targets as constant
             loss_state = mse_loss(state_embed, (next_state - cumulative_action).detach())
             loss_action = mse_loss(cumulative_action, (next_state - state_embed).detach())
+
+            state_dists = state_diffs.norm(dim = -1)
+            action_dists = action_embed[:, :-1, :].norm(dim = -1) + action_embed[:, 1:, :].norm(dim = -1)
+            # add some slack to the triangle inequality
+            l_tri_a = relu(state_dists.detach() - action_dists + 1e-4).mean()
+            l_tri_s = relu(state_dists - action_dists.detach() + 1e-4).mean()
+            # loss_state += l_tri_s * self.lambda_t
+            # loss_action += l_tri_a * self.lambda_t
 
         else:
             loss_state = mse_loss(state_embed, next_state - action_embed.detach())
@@ -247,15 +260,18 @@ class IntrinsicMapLearner(torch.nn.Module):
             next_state = self.state_embed(next_obs)
         loss = mse_loss(next_state - state_embed, action_embed.detach())
 
-        # TODO : loss on the decoder to maximize covariance with state changes
-        # barrier loss for now
         action = self.tanh(self.action_decoder(action_embed))
-        loss_a = log_barrier_loss(action.norm(dim = -1),
-                                  1, margin = self.eps).mean()
+        # measure of magnitude agreement between state changes and action
+        scale = np.sqrt(self.embed_dim)
+        action_scale = np.sqrt(self.action_dim)
+        with torch.no_grad():
+            inner_alignment = (next_state - state_embed).norm(dim = -1) / scale
+        loss_a = mse_loss(action.norm(dim = -1) / action_scale,
+                          inner_alignment)
 
         return loss, loss_a
     
-    def step_to_goal(self, curr_obs, goal_obs, **kwargs):
+    def step_to_goal(self, curr_obs, goal_obs, maximal_step = True, **kwargs):
         with torch.no_grad():
             curr_embed = self.state_embed(curr_obs)
             goal_embed = self.state_embed(goal_obs)
@@ -265,13 +281,14 @@ class IntrinsicMapLearner(torch.nn.Module):
 
             action = self.action_decoder(diff)
             action = self.tanh(action)
+            if maximal_step:
+                action = action / action.norm(dim = -1).unsqueeze(-1)
 
         return action
             
 if __name__ == "__main__":
     from gymnasium import make
     from tqdm import tqdm
-    import numpy as np
     import matplotlib.pyplot as plt
     from gymnasium.wrappers import RecordVideo
     from utils import ReplayBuffer
@@ -287,24 +304,31 @@ if __name__ == "__main__":
     deep_map_learner = DeepMapLearner(obs_dim + 1, action_dim,
                                      [256, 128, 64, 32], [256, 128, 64, 32],
                                      activation = SymLog()).to(device)
+    # deep_map_learner = IntrinsicMapLearner(obs_dim + 1, action_dim,
+    #                                        hidden_dim_act = [32, 128],
+    #                                        hidden_dim_obs = [256, 128, 64, 32],)
+    deep_map_learner = deep_map_learner.to(device)
 
-    n_epochs = 100
-    eps_per_epoch = 30
-    steps_per_epoch = 8 * eps_per_epoch
+    n_epochs = 150
+    eps_per_epoch = 4
+    steps_per_epoch = 4 * eps_per_epoch
     batch_size = 256
     episode_count = 0
 
     errors = []
     errors_deep = []
     pbar = tqdm(range(n_epochs * eps_per_epoch + n_epochs * steps_per_epoch))
-    buffer = ReplayBuffer(obs_dim, action_dim, return_trajectory=True)
+    buffer = ReplayBuffer(obs_dim, action_dim,
+                          return_trajectory = True,
+                          special_buffer_dim = deep_map_learner.embed_dim,)
 
     optimizer_state = torch.optim.Adam(deep_map_learner.state_embed.parameters(),
                                  lr = 0.00001)
-    optimizer_action = torch.optim.Adam(deep_map_learner.action_embed.parameters(),
-                                        lr = 0.0001)
+    if not isinstance(deep_map_learner, IntrinsicMapLearner):
+        optimizer_action = torch.optim.Adam(deep_map_learner.action_embed.parameters(),
+                                            lr = 0.0001)
     optimizer_decoder = torch.optim.Adam(deep_map_learner.action_decoder.parameters(),
-                                        lr = 0.001)
+                                         lr = 0.001)
 
     for epoch in range(n_epochs):
         for _ in range(eps_per_epoch):
@@ -312,12 +336,21 @@ if __name__ == "__main__":
             done = False
             counter = 0
             while not done:
-                action = env.action_space.sample()
+                if isinstance(deep_map_learner, IntrinsicMapLearner):
+                    with torch.no_grad():
+                        action, a_embeds = deep_map_learner.sample_actions(1,
+                                                                           device = device)
+                        # conver to numpy
+                        action = action[0].cpu().numpy()
+                        a_embeds = a_embeds[0]
+                else:
+                    action = env.action_space.sample()
+                    a_embeds = None
                 next_obs, reward, terminated, truncated, info = env.step(action)
-                done = (terminated or truncated)
 
                 done = (terminated or truncated)
-                buffer.push(obs, action, next_obs, done, episode = episode_count, reward = reward)
+                buffer.push(obs, action, next_obs, done, special = a_embeds, episode = episode_count, reward = reward)
+                obs = next_obs
                 counter += 1
 
                 pbar.set_description(f"Epoch: {epoch}| Counter: {counter}")
@@ -326,7 +359,7 @@ if __name__ == "__main__":
             pbar.update(1)
         
         for _ in range(steps_per_epoch):
-            states, actions, rewards, next_states, dones, skills = buffer.sample(batch_size = batch_size,
+            states, actions, rewards, next_states, dones, a_embeds = buffer.sample(batch_size = batch_size,
                                                                                  device = device)
             traj_length = states.shape[1]
             # concat states and dones
@@ -337,18 +370,25 @@ if __name__ == "__main__":
             pred_error = map_learner.manual_update(states[:, 0, :],
                                                    actions[:, 0, :],
                                                    next_states[:, 0, :])
-            loss_state, loss_action, loss_decode = deep_map_learner.get_loss(states,
-                                                                             actions,
-                                                                             next_states)
+            if isinstance(deep_map_learner, IntrinsicMapLearner):
+                loss_state, loss_decode = deep_map_learner.get_loss(states[:, 0, :],
+                                                                    a_embeds[:, 0, :],
+                                                                    next_states[:, 0, :])
+            else:
+                loss_state, loss_action, loss_decode = deep_map_learner.get_loss(states,
+                                                                                 actions,
+                                                                                 next_states)
 
             optimizer_state.zero_grad()
-            optimizer_action.zero_grad()
             optimizer_decoder.zero_grad()
             loss_state.backward(retain_graph = True)
-            loss_action.backward()
             loss_decode.backward()
+
+            if not isinstance(deep_map_learner, IntrinsicMapLearner):
+                optimizer_action.zero_grad()
+                loss_action.backward()
+                optimizer_action.step()
             optimizer_state.step()
-            optimizer_action.step()
             optimizer_decoder.step()
 
             errors.append(pred_error.norm(dim = -1).mean().item())
@@ -364,7 +404,7 @@ if __name__ == "__main__":
     goal_obs = torch.zeros(obs_dim + 1).to(device)
     goal_obs[0] = goal_xy[0]
     goal_obs[1] = goal_xy[1]
-    goal_obs[2] = 0.3
+    goal_obs[2] = 0.5
     
     env = make(env_name,
                render_mode="rgb_array",
@@ -432,6 +472,6 @@ if __name__ == "__main__":
                     label = name,
                     c = colors, cmap = cmap)
     ax[1].scatter(goal_xy[0], goal_xy[1], label = "Goal")
-
+    ax[0].legend()
     plt.tight_layout()
     fig.savefig("tmp/map_learner.png", dpi = 300)
