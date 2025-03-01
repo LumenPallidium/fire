@@ -68,6 +68,57 @@ class LinearMapLearner(torch.nn.Module):
 
         return action.clamp(-1, 1)
     
+class HierarchicalActionComposer(torch.nn.Module):
+    def __init__(self,
+                 dim,
+                 activation = torch.nn.Tanh(),
+                 level_transform = True):
+        super().__init__()
+        self.dim = dim
+        self.activation = activation
+
+        self.pair_weight = torch.nn.Parameter(torch.randn(2 * dim, dim))
+
+        if level_transform:
+            self.level_transform = torch.nn.Linear(dim, dim)
+        else:
+            self.level_transform = torch.nn.Identity()
+
+    def forward(self, actions):
+        """
+        Takes in an arbitrary number of actions and composes them
+        into a single resulting action. Assumes shape is (B, N, D)
+        """
+        composed_action = actions.clone()
+        while composed_action.shape[1] != 1:
+            # apply activation beforehand
+            composed_action = self.activation(composed_action)
+            odd = composed_action.shape[1] % 2
+            if odd:
+                # randomly extract one action
+                idx = torch.randint(0, composed_action.shape[1] - 1, (1,))
+                action = composed_action[:, idx]
+                action = self.level_transform(action)
+
+                composed_action = torch.cat([composed_action[:, :idx],
+                                            composed_action[:, idx + 1:]],
+                                            dim = 1)
+            composed_action = composed_action.view(-1,
+                                                   composed_action.shape[1] // 2,
+                                                   2 * self.dim)
+            composed_action = torch.einsum("bnd,dm->bnm",
+                                           composed_action,
+                                           self.pair_weight)
+            composed_action = self.level_transform(composed_action)
+            if odd:
+                # reinsert the action
+                idx = 1 + idx // 2
+                composed_action = torch.cat([composed_action[:, :idx],
+                                            action,
+                                            composed_action[:, idx:]],
+                                            dim = 1)
+        return composed_action.squeeze(1)
+    
 class DeepMapLearner(torch.nn.Module):
     def __init__(self, state_dim, action_dim,
                  hidden_dim_obs = 512,
@@ -75,9 +126,8 @@ class DeepMapLearner(torch.nn.Module):
                  activation = torch.nn.Tanh(),
                  autoencode = True,
                  lambda_v = 1,
-                 lambda_area = 1,
-                 lambda_t = 1,
-                 eps = 2):
+                 lambda_area = 0.5,
+                 lambda_t = 1):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -92,7 +142,6 @@ class DeepMapLearner(torch.nn.Module):
         self.lambda_v = lambda_v
         self.lambda_area = lambda_area
         self.lambda_t = lambda_t
-        self.eps = eps
         self.autoencode = autoencode
 
         self.state_embed = SparseMLP([state_dim] + hidden_dim_obs,
@@ -105,6 +154,8 @@ class DeepMapLearner(torch.nn.Module):
             self.action_decoder = SparseMLP(hidden_dim_act_inv + [action_dim],
                                             activation=activation)
         
+        # for tracking stats
+        self.state_vars = []
 
     def forward(self, state, action):
         state_embed = self.state_embed(state)
@@ -116,59 +167,29 @@ class DeepMapLearner(torch.nn.Module):
         action_embed = self.action_embed(action)
         with torch.no_grad():
             next_state = self.state_embed(next_obs)
-        if (len(obs.shape) == 3) and (obs.shape[1] > 1):
-            # note this is d(s1, s3) not d(s1, s2) (for triangle inequality)
-            state_diffs = next_state[:, 1:, :] - state_embed[:, :-1, :]
-            # multistep prediction
-            cumulative_action = action_embed.sum(dim = 1)
-            state_embed = state_embed[:, 0, :]
-            next_state = next_state[:, -1, :]
-            # can't mix up the gradients - treat targets as constant
-            loss_state = mse_loss(state_embed, (next_state - cumulative_action).detach())
-            loss_action = mse_loss(cumulative_action, (next_state - state_embed).detach())
 
-            state_dists = state_diffs.norm(dim = -1)
-            action_dists = action_embed[:, :-1, :].norm(dim = -1) + action_embed[:, 1:, :].norm(dim = -1)
-            # add some slack to the triangle inequality
-            l_tri_a = relu(state_dists.detach() - action_dists + 1e-4).mean()
-            l_tri_s = relu(state_dists - action_dists.detach() + 1e-4).mean()
-            # loss_state += l_tri_s * self.lambda_t
-            # loss_action += l_tri_a * self.lambda_t
+        state_vars = state_embed.var(dim = (0, 1))
+        self.state_vars.append(state_vars.mean().item())
 
-        else:
-            loss_state = mse_loss(state_embed, next_state - action_embed.detach())
-            loss_action = mse_loss(action_embed, next_state - state_embed.detach())
+        # multistep prediction
+        state_embed_start = state_embed[:, 0, :]
+        next_state_end = next_state[:, -1, :]
+        cumulative_action = action_embed.clone()
+        # can't mix up the gradients - treat targets as constant
+        loss_state = mse_loss(state_embed_start,
+                              (next_state_end - cumulative_action).detach())
+        loss_action = mse_loss(cumulative_action,
+                               (next_state_end - state_embed_start).detach())
 
-            if self.lambda_area != 0:
-                with torch.no_grad():
-                    act_denom = (torch.norm(action, dim = -1) + 1e-6)
-                    real_scale = torch.norm(next_obs - obs, dim = -1) / act_denom
-                vol_loss_action = mse_loss(action_embed.norm(dim = -1), real_scale)
-                vol_loss_state = mse_loss((next_state - state_embed).norm(dim = -1),
-                                          real_scale)
-                loss_action += self.lambda_area * vol_loss_action
-                loss_state += self.lambda_area * vol_loss_state
-
-        # this regularizes the embeddings
-        # loss_barrier_action = log_barrier_loss(action_embed.norm(dim = -1),
-        #                                        1, margin = self.eps).mean()
-        # loss_barrier_state = log_barrier_loss(state_embed.norm(dim = -1),
-        #                                       1, margin = self.eps).mean()
-        ortho_loss_action = ortho_loss(action_embed)
-        ortho_loss_state = ortho_loss(state_embed)
-
-        if not torch.isnan(ortho_loss_action):#loss_barrier_action):
-            loss_action += self.lambda_v * ortho_loss_action#loss_barrier_action
-        if not torch.isnan(ortho_loss_state):#loss_barrier_state):
-            loss_state += self.lambda_v * ortho_loss_state#loss_barrier_state
         if self.autoencode:
-            action_embed_ = action_embed.detach()
+            action_embed_ = action_embed.clone().detach()
             action_hat = self.action_decoder(action_embed_)
             action_hat = self.tanh(action_hat)
             # weight magnitude and alignment separately
             magnitude_hat, magnitude = action_hat.norm(dim = -1), action_embed_.norm(dim = -1)
             mag_loss = mse_loss(magnitude_hat, magnitude)
-            align_loss = -(action_hat * action).sum(dim = -1) / (magnitude_hat * magnitude)[:, None]
+            full_magnitude = (magnitude_hat * magnitude)[:, None]
+            align_loss = -(action_hat * action).sum(dim = -1) / full_magnitude.detach()
             loss_decode = mag_loss + 2 * align_loss.mean()
         else:
             loss_decode = torch.tensor(0.0,
@@ -197,14 +218,12 @@ class DeepMapLearner(torch.nn.Module):
         action = action.detach().clone()
         return action
     
-    def step_to_goal(self, curr_obs, goal_obs, scale = None, **kwargs):
+    def step_to_goal(self, curr_obs, goal_obs, **kwargs):
         with torch.no_grad():
             curr_embed = self.state_embed(curr_obs)
             goal_embed = self.state_embed(goal_obs)
 
-            diff = goal_embed - curr_embed
-            if scale is not None:
-                diff = (diff / diff.norm(dim = -1).unsqueeze(-1)) * scale
+            diff = self.projector(torch.cat([curr_embed, goal_embed], dim = -1))
         if self.autoencode:
             with torch.no_grad():
                 action = self.action_decoder(diff)
@@ -217,13 +236,114 @@ class DeepMapLearner(torch.nn.Module):
 
         return action
     
+class DeepMapLearnerComplex(DeepMapLearner):
+    def __init__(self, state_dim, action_dim,
+                 hidden_dim_obs = 512,
+                 hidden_dim_act = 512,
+                 activation = torch.nn.Tanh(),
+                 autoencode = True,
+                 lambda_v = 1,
+                 lambda_area = 0.5,
+                 lambda_t = 1):
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        if isinstance(hidden_dim_obs, int):
+            hidden_dim_obs = [hidden_dim_obs]
+        if isinstance(hidden_dim_act, int):
+            hidden_dim_act = [hidden_dim_act]
+        self.hidden_dim_obs = hidden_dim_obs
+        self.hidden_dim_act = hidden_dim_act
+        assert hidden_dim_act[-1] == hidden_dim_obs[-1], "Last hidden dim must match"
+        self.embed_dim = hidden_dim_obs[-1]
+        self.lambda_v = lambda_v
+        self.lambda_area = lambda_area
+        self.lambda_t = lambda_t
+        self.autoencode = autoencode
+
+        self.state_embed = SparseMLP([state_dim] + hidden_dim_obs,
+                                     activation=activation)
+        self.action_embed = SparseMLP([action_dim] + hidden_dim_act,
+                                      activation=activation)
+        self.projector = SparseMLP([2 * self.embed_dim, 2 * self.embed_dim, self.embed_dim],
+                                   activation = activation)
+        self.composer = HierarchicalActionComposer(self.embed_dim,
+                                                   activation = activation)
+        self.tanh = torch.nn.Identity()
+        if self.autoencode:
+            hidden_dim_act_inv = hidden_dim_act[::-1]
+            self.action_decoder = SparseMLP(hidden_dim_act_inv + [action_dim],
+                                            activation=activation)
+        
+        # for tracking stats
+        self.state_vars = []
+        
+
+    def forward(self, state, action):
+        state_embed = self.state_embed(state)
+        action_embed = self.action_embed(action)
+        return state_embed + action_embed
+    
+    def get_loss(self, obs, action, next_obs):
+        state_embed = self.state_embed(obs)
+        action_embed = self.action_embed(action)
+        with torch.no_grad():
+            next_state = self.state_embed(next_obs)
+
+        state_vars = state_embed.var(dim = (0, 1))
+        self.state_vars.append(state_vars.mean().item())
+
+        # multistep prediction
+        cumulative_action = self.composer(action_embed)
+        state_embed_start = state_embed[:, 0, :]
+        next_state_end = next_state[:, -1, :]
+        # can't mix up the gradients - treat targets as constant
+        loss_state = mse_loss(state_embed_start,
+                              (next_state_end - cumulative_action).detach())
+        loss_action = mse_loss(cumulative_action,
+                               (next_state_end - state_embed_start).detach())
+        
+        loss_state += self.lambda_area * (1 / (state_vars + 1e-6)).mean()
+        self.lambda_area *= 0.999
+
+        # for all steps to the final state, see how the projection gets the first action
+        next_state_ends = next_state_end.unsqueeze(1).repeat(1, state_embed.shape[1], 1)
+        state_end_pairs = torch.cat([state_embed,
+                                     next_state_ends],
+                                    dim = -1)
+        action_hat = self.projector(state_end_pairs.clone().detach().requires_grad_(True))
+        loss_state += mse_loss(action_embed.detach(), action_hat)
+
+        # make sure projector and cumulative action agree
+        state_end_pairs = torch.cat([state_embed_start,
+                                     state_embed_start + cumulative_action],
+                                    dim = -1)
+        action_hat = self.projector(state_end_pairs.clone().detach().requires_grad_(True))
+        # it should project onto the first step/action
+        loss_state += mse_loss(action_hat, action_embed[:, 0, :].detach())
+
+        if self.autoencode:
+            action_embed_ = action_embed.clone().detach()
+            action_hat = self.action_decoder(action_embed_)
+            action_hat = self.tanh(action_hat)
+            # weight magnitude and alignment separately
+            magnitude_hat, magnitude = action_hat.norm(dim = -1), action_embed_.norm(dim = -1)
+            mag_loss = mse_loss(magnitude_hat, magnitude)
+            full_magnitude = (magnitude_hat * magnitude)[:, None]
+            align_loss = -(action_hat * action).sum(dim = -1) / full_magnitude.detach()
+            loss_decode = mag_loss + 2 * align_loss.mean()
+        else:
+            loss_decode = torch.tensor(0.0,
+                                       device = obs.device)
+        return loss_state, loss_action, loss_decode
+    
+    
 class IntrinsicMapLearner(torch.nn.Module):
     def __init__(self, state_dim, action_dim,
                  hidden_dim_obs = 512,
                  hidden_dim_act = 512,
                  activation = SymLog(),
-                 action_std = 0.1,
-                 eps = 1):
+                 action_std = 0.1):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -236,14 +356,14 @@ class IntrinsicMapLearner(torch.nn.Module):
         assert hidden_dim_act[0] == hidden_dim_obs[-1], "Last hidden dim must match"
         self.embed_dim = hidden_dim_obs[-1]
         self.action_std = action_std
-        self.eps = eps
 
         self.state_embed = SparseMLP([state_dim] + hidden_dim_obs,
                                      activation=activation)
 
         self.action_decoder = SparseMLP(hidden_dim_act + [action_dim],
                                         activation=activation)
-        self.tanh = torch.nn.Identity()
+        self.tanh = torch.nn.Tanh()
+        self.state_vars = []
         
     def forward(self, action_embed):
         return self.tanh(self.action_decoder(action_embed))
@@ -258,6 +378,10 @@ class IntrinsicMapLearner(torch.nn.Module):
         state_embed = self.state_embed(obs)
         with torch.no_grad():
             next_state = self.state_embed(next_obs)
+
+        state_vars = state_embed.var(dim = 0)
+        self.state_vars.append(state_vars.mean().item())
+
         loss = mse_loss(next_state - state_embed, action_embed.detach())
 
         action = self.tanh(self.action_decoder(action_embed))
@@ -271,7 +395,7 @@ class IntrinsicMapLearner(torch.nn.Module):
 
         return loss, loss_a
     
-    def step_to_goal(self, curr_obs, goal_obs, maximal_step = True, **kwargs):
+    def step_to_goal(self, curr_obs, goal_obs, **kwargs):
         with torch.no_grad():
             curr_embed = self.state_embed(curr_obs)
             goal_embed = self.state_embed(goal_obs)
@@ -281,8 +405,6 @@ class IntrinsicMapLearner(torch.nn.Module):
 
             action = self.action_decoder(diff)
             action = self.tanh(action)
-            if maximal_step:
-                action = action / action.norm(dim = -1).unsqueeze(-1)
 
         return action
             
