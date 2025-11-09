@@ -6,9 +6,11 @@ def ortho_loss(x):
     b = x.shape[0]
     xx = torch.einsum("...i,...j->...ij",
                       x, x)
-    xx -= torch.eye(xx.shape[-1], device = xx.device)
+    # set diagonal to zero
+    diag = torch.eye(xx.shape[-1], device=xx.device).unsqueeze(0)
+    xx = xx * (1 - diag)
     xx /= (2 * b * (b - 1))
-    return (xx**2).sum() - (1/b) * (x**2).sum()
+    return xx.sum() - (1/b) * (x**2).sum()
 
 class MLPEmbed(torch.nn.Module):
     def __init__(self,
@@ -122,14 +124,16 @@ class TDJActor(torch.nn.Module):
                  task_dim,
                  state_dim,
                  hidden_dim = 256,
-                 out_dim = 10):
+                 out_dim = 10,
+                 out_activation = torch.nn.Tanh()):
         super().__init__()
         self.task_embed = MLPEmbed(task_dim, 2 * hidden_dim, hidden_dim)
         self.state_embed = MLPEmbed(state_dim, 2 * hidden_dim, hidden_dim)
         self.actor = torch.nn.Sequential(
             torch.nn.Linear(hidden_dim, hidden_dim),
             torch.nn.ReLU(),
-            torch.nn.Linear(hidden_dim, out_dim),)
+            torch.nn.Linear(hidden_dim, out_dim),
+            out_activation)
         
     def forward(self, task, state):
         task_e = self.task_embed(task * state)
@@ -246,13 +250,14 @@ if __name__ == "__main__":
     import numpy as np
     from utils import ReplayBuffer
     env_name = "Ant-v5"
-    n_epochs = 1500 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
+    n_epochs = 50 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
     steps_per_epoch = 32
     batch_size = 256
     episodes_per_epoch = 1
     train_start_steps = 10000
 
-    env = gym.make(env_name)
+    env = gym.make(env_name,
+                   forward_reward_weight = 0.0,)
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
