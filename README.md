@@ -7,3 +7,4 @@ Repository for experiments with artificial agency (e.g. RL, intrinsic motivation
 * [Soft Actor Critic](https://arxiv.org/pdf/1801.01290)
 * [METRA: Scalable Unsupervised RL with Metric-Aware Abstraction](https://arxiv.org/abs/2310.08887)
 * [Can a MISL Fly? Analysis and Ingredients for Mutual Information Skill Learning](https://arxiv.org/abs/2412.08021)
+* [TD-JEPA](https://arxiv.org/abs/2510.00739)

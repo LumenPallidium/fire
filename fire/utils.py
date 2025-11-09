@@ -19,6 +19,23 @@ def log_barrier_loss(x, target, margin = 0.01, margin_fraction = None, epsilon =
     return -(torch.log(epsilon + x - lower) + 
              torch.log(epsilon + upper - x))
 
+def entropy(probs):
+    return -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+
+def custom_sparse_init(tensor, sparsity = 0.1):
+    with torch.no_grad():
+        fan_in = tensor.size(1)
+        scale = 1 / math.sqrt(fan_in)
+        tensor.data.uniform_(-1, 1).mul_(scale)
+        mask = torch.rand_like(tensor) > sparsity
+        tensor.data *= mask
+
+def symlog(x):
+    return torch.sign(x) * torch.log(torch.abs(x) + 1)
+
+def symexp(x):
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+
 def sample_geometric(gamma, n = 1, max_len = 100):
     dist = torch.distributions.Geometric(probs = 1 - gamma)
     sample = dist.sample((n,))
@@ -130,6 +147,9 @@ class ReplayBuffer:
                 torch.tensor(self.done_buffer[idx], device = device),
                 torch.tensor(self.special_buffer[idx], device = device) if self.special_buffer is not None else None)
     
+    def __len__(self):
+        return min(self.total, self.capacity)
+    
 class ConvEncoder(torch.nn.Module):
     def __init__(self,
                  input_channels,
@@ -147,23 +167,6 @@ class ConvEncoder(torch.nn.Module):
         x = torch.functional.F.layer_norm(x, x.shape[1:])
         x = self.activation(self.conv3(x))
         return x.view(x.size(0), -1)
-
-def entropy(probs):
-    return -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
-
-def custom_sparse_init(tensor, sparsity = 0.1):
-    with torch.no_grad():
-        fan_in = tensor.size(1)
-        scale = 1 / math.sqrt(fan_in)
-        tensor.data.uniform_(-1, 1).mul_(scale)
-        mask = torch.rand_like(tensor) > sparsity
-        tensor.data *= mask
-
-def symlog(x):
-    return torch.sign(x) * torch.log(torch.abs(x) + 1)
-
-def symexp(x):
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
 
 class SymLog(torch.nn.Module):
     def __init__(self):
@@ -330,7 +333,6 @@ class DoubleQNetwork(torch.nn.Module):
         for p, q in zip(self.q2.parameters(), other.q2.parameters()):
             p.data = alpha * p.data + (1 - alpha) * q.data
 
-
 class SACWrapper(torch.nn.Module):
     """
     Convenience wrapper so we can do most SAC steps in a single call and
@@ -436,7 +438,7 @@ class IntScheduler:
             return self.end
         val = self.start + self.slope * step
         return int(val)
-                                      
+                       
 
 if __name__ == "__main__":
     # testing SAC here

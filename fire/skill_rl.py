@@ -2,7 +2,7 @@ import os
 import torch
 import numpy as np
 from gymnasium import make
-from utils import ReplayBuffer, NormedSparseMLP, SACWrapper, SkillConditionedPolicy
+from utils import ReplayBuffer, NormedSparseMLP, SACWrapper, SkillConditionedPolicy, TDJEPA
 from copy import deepcopy
 from tqdm import tqdm
 
@@ -229,7 +229,7 @@ def continuous_metra(n_epochs = 100,
 def continuous_csf(n_epochs = 100,
                    steps_per_epoch = 512,
                    batch_size = 256,
-                   buffer_capacity = int(1e4),
+                   buffer_capacity = int(1e6),
                    episodes_per_epoch = 4,
                    gamma = 0.99,
                    skill_dim = 2,
@@ -249,16 +249,13 @@ def continuous_csf(n_epochs = 100,
     state_representer = StateRepresenter(obs_dim, skill_dim).to(device)
     policy = SkillConditionedPolicy(obs_dim, action_dim, skill_dim = skill_dim,
                                     variance = True).to(device)
-    sac_model = SACWrapper(obs_dim, action_dim,
-                           #TODO : don't hardcode reward dim
-                           reward_dim = 256).to(device)
     successor_encoder = SuccessorEncoder(obs_dim, action_dim, skill_dim).to(device)
     successor_encoder_ema = deepcopy(successor_encoder)
     successor_encoder_ema.requires_grad_(False)
 
     optimizer_policy = torch.optim.Adam(policy.parameters(), lr = 1e-4)
-    optimizer_successor = torch.optim.Adam(successor_encoder.parameters(), lr = 1e-4)
-    optimizer_encoder = torch.optim.Adam(state_representer.parameters(), lr = 1e-4)
+    optimizer_successor = torch.optim.Adam(successor_encoder.parameters(), lr = 3e-4)
+    optimizer_encoder = torch.optim.Adam(state_representer.parameters(), lr = 3e-4)
 
     buffer = ReplayBuffer(obs_dim,
                           action_dim,
@@ -297,7 +294,7 @@ def continuous_csf(n_epochs = 100,
             
             state_reps = state_representer(states)
             next_state_reps = state_representer(next_states)
-            successors = successor_encoder(states, new_actions, skills)
+            successors = successor_encoder(states, actions, skills)
 
             state_diffs = next_state_reps - state_reps
             counterfactual_skills = skill_space.sample(n_samples = batch_size).to(device)
@@ -306,7 +303,7 @@ def continuous_csf(n_epochs = 100,
             nce_term = torch.einsum("bi,mi->bm",
                                     state_diffs,
                                     counterfactual_skills)
-            nce_term = torch.exp(nce_term).mean(dim = -1).log()
+            nce_term = torch.exp(nce_term).sum(dim = -1).log()
             encoder_loss += nce_term.mean()
 
             with torch.no_grad():
@@ -317,20 +314,17 @@ def continuous_csf(n_epochs = 100,
 
             successor_loss = torch.nn.functional.mse_loss(successors,
                                                           successor_td.detach())
-            policy_reward = (successors * skills).sum(dim=-1)
-            _, policy_loss = sac_model([states, actions, rewards, next_states, dones, skills],
-                                       policy,
-                                       reward = policy_reward)
+            
             
             encoder_loss.backward()
             successor_loss.backward(retain_graph = True)
-            policy_loss.backward()
-
             optimizer_encoder.step()
             optimizer_successor.step()
-            sac_model.step()
+
+            policy_successors = successor_encoder(states, new_actions, skills)
+            policy_loss = -(policy_successors * skills).sum(dim=-1).mean()
+            policy_loss.backward()
             optimizer_policy.step()
-            sac_model.update_targets()
 
             successor_encoder_ema.ema(successor_encoder)
             losses.append([encoder_loss.item(),
@@ -342,23 +336,22 @@ def continuous_csf(n_epochs = 100,
         if epoch % save_model_every == 0:
             # save models
             torch.save(state_representer.state_dict(),
-                    f"tmp/state_representer_{epoch}.pt")
+                    f"tmp/csf_state_representer_{epoch}.pt")
             torch.save(policy.state_dict(),
-                    f"tmp/policy_{epoch}.pt")
+                    f"tmp/csf_policy_{epoch}.pt")
             torch.save(successor_encoder.state_dict(),
-                    f"tmp/successor_encoder_{epoch}.pt")
-            torch.save(sac_model.state_dict(),
-                       f"tmp/sac_model_{epoch}.pt")
+                    f"tmp/csf_successor_encoder_{epoch}.pt")
     return np.array(losses), xy_trajs
 
 def skill_video(checkpoint_dir = "tmp/",
                 env_name = "Ant-v5",
+                policy_prefix = "",
                 skill_dim = 2):
     from gymnasium.wrappers import RecordVideo
     
     paths = [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir)]
     # filter to policy and get max epoch
-    paths = [f for f in paths if "policy" in f]
+    paths = [f for f in paths if policy_prefix+"policy" in f]
     paths = sorted(paths, key = lambda x: int(x.split("_")[-1].split(".")[0]))
     path = paths[-1]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -398,21 +391,29 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import os
     os.makedirs("tmp", exist_ok = True)
-    n_epochs = 3000
-    episodes_per_epoch = 8
+    n_epochs = 300
+    episodes_per_epoch = 4
     steps_per_epoch = 200
     traj_snapshot_every = n_epochs // 10
     save_model_every = n_epochs // 100
     smoothing_num = max(1, int(n_epochs / 5))
     smooth_kernel = np.ones(smoothing_num) / smoothing_num
+    dists = None
 
-    losses, trajs, dists = continuous_metra(n_epochs = n_epochs,
-                                            steps_per_epoch = steps_per_epoch,
-                                            buffer_capacity = int(1e6),
-                                            episodes_per_epoch = episodes_per_epoch,
-                                            traj_snapshot_every = traj_snapshot_every,
-                                            save_model_every = save_model_every,
-                                            batch_size = 256)
+    # losses, trajs, dists = continuous_metra(n_epochs = n_epochs,
+    #                                         steps_per_epoch = steps_per_epoch,
+    #                                         buffer_capacity = int(1e6),
+    #                                         episodes_per_epoch = episodes_per_epoch,
+    #                                         traj_snapshot_every = traj_snapshot_every,
+    #                                         save_model_every = save_model_every,
+    #                                         batch_size = 256)
+    losses, trajs = continuous_csf(n_epochs = n_epochs,
+                                   steps_per_epoch = steps_per_epoch,
+                                   buffer_capacity = int(1e6),
+                                   episodes_per_epoch = episodes_per_epoch,
+                                   traj_snapshot_every = traj_snapshot_every,
+                                   save_model_every = save_model_every,
+                                   batch_size = 256)
 
     fig, ax = plt.subplots(1, 3, figsize = (12, 6))
     # plot the losses
@@ -430,11 +431,12 @@ if __name__ == "__main__":
         alpha = (i / len(trajs))
         ax[1].plot(traj[:, 0], traj[:, 1], alpha = alpha)
 
-    # smooth
-    dists_time_np = np.array(dists)
-    dists_time_np = np.convolve(dists_time_np,
-                                smooth_kernel,
-                                mode = "valid")
-    ax[2].plot(dists_time_np)
+    if dists is not None:
+        # smooth
+        dists_time_np = np.array(dists)
+        dists_time_np = np.convolve(dists_time_np,
+                                    smooth_kernel,
+                                    mode = "valid")
+        ax[2].plot(dists_time_np)
 
-    fig.savefig("tmp/skill_results.png", dpi = 300)
+        fig.savefig("tmp/skill_results.png", dpi = 300)

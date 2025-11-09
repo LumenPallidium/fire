@@ -124,10 +124,7 @@ class DeepMapLearner(torch.nn.Module):
                  hidden_dim_obs = 512,
                  hidden_dim_act = 512,
                  activation = torch.nn.Tanh(),
-                 autoencode = True,
-                 lambda_v = 1,
-                 lambda_area = 0.5,
-                 lambda_t = 1):
+                 autoencode = True,):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -139,9 +136,6 @@ class DeepMapLearner(torch.nn.Module):
         self.hidden_dim_act = hidden_dim_act
         assert hidden_dim_act[-1] == hidden_dim_obs[-1], "Last hidden dim must match"
         self.embed_dim = hidden_dim_obs[-1]
-        self.lambda_v = lambda_v
-        self.lambda_area = lambda_area
-        self.lambda_t = lambda_t
         self.autoencode = autoencode
 
         self.state_embed = SparseMLP([state_dim] + hidden_dim_obs,
@@ -244,53 +238,38 @@ class DeepMapLearnerComplex(DeepMapLearner):
                  autoencode = True,
                  lambda_v = 1,
                  lambda_area = 0.5,
-                 lambda_t = 1):
-        super().__init__()
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        if isinstance(hidden_dim_obs, int):
-            hidden_dim_obs = [hidden_dim_obs]
-        if isinstance(hidden_dim_act, int):
-            hidden_dim_act = [hidden_dim_act]
-        self.hidden_dim_obs = hidden_dim_obs
-        self.hidden_dim_act = hidden_dim_act
-        assert hidden_dim_act[-1] == hidden_dim_obs[-1], "Last hidden dim must match"
-        self.embed_dim = hidden_dim_obs[-1]
+                 lambda_t = 100):
+        super().__init__(
+            state_dim, action_dim,
+            hidden_dim_obs = hidden_dim_obs,
+            hidden_dim_act = hidden_dim_act,
+            activation = activation,
+            autoencode = autoencode
+        )
+
         self.lambda_v = lambda_v
         self.lambda_area = lambda_area
         self.lambda_t = lambda_t
         self.autoencode = autoencode
 
-        self.state_embed = SparseMLP([state_dim] + hidden_dim_obs,
-                                     activation=activation)
-        self.action_embed = SparseMLP([action_dim] + hidden_dim_act,
-                                      activation=activation)
         self.projector = SparseMLP([2 * self.embed_dim, 2 * self.embed_dim, self.embed_dim],
                                    activation = activation)
         self.composer = HierarchicalActionComposer(self.embed_dim,
                                                    activation = activation)
-        self.tanh = torch.nn.Identity()
-        if self.autoencode:
-            hidden_dim_act_inv = hidden_dim_act[::-1]
-            self.action_decoder = SparseMLP(hidden_dim_act_inv + [action_dim],
-                                            activation=activation)
-        
-        # for tracking stats
-        self.state_vars = []
         
 
     def forward(self, state, action):
         state_embed = self.state_embed(state)
-        action_embed = self.action_embed(action)
+        action_embed = self.composer(self.action_embed(action))
         return state_embed + action_embed
     
     def get_loss(self, obs, action, next_obs):
-        state_embed = self.state_embed(obs)
-        action_embed = self.action_embed(action)
         with torch.no_grad():
-            next_state = self.state_embed(next_obs)
+            state_embed = self.state_embed(obs)
+        action_embed = self.action_embed(action)
+        next_state = self.state_embed(next_obs)
 
-        state_vars = state_embed.var(dim = (0, 1))
+        state_vars = next_state.var(dim = (0, 1))
         self.state_vars.append(state_vars.mean().item())
 
         # multistep prediction
@@ -298,13 +277,12 @@ class DeepMapLearnerComplex(DeepMapLearner):
         state_embed_start = state_embed[:, 0, :]
         next_state_end = next_state[:, -1, :]
         # can't mix up the gradients - treat targets as constant
-        loss_state = mse_loss(state_embed_start,
-                              (next_state_end - cumulative_action).detach())
+        loss_state = mse_loss(next_state_end,
+                              (state_embed_start + cumulative_action).detach())
         loss_action = mse_loss(cumulative_action,
                                (next_state_end - state_embed_start).detach())
         
         loss_state += self.lambda_area * (1 / (state_vars + 1e-6)).mean()
-        self.lambda_area *= 0.999
 
         # for all steps to the final state, see how the projection gets the first action
         next_state_ends = next_state_end.unsqueeze(1).repeat(1, state_embed.shape[1], 1)
@@ -323,19 +301,10 @@ class DeepMapLearnerComplex(DeepMapLearner):
         loss_state += mse_loss(action_hat, action_embed[:, 0, :].detach())
 
         if self.autoencode:
-            action_embed_ = action_embed.clone().detach()
-            action_hat = self.action_decoder(action_embed_)
+            action_hat = self.action_decoder(action_embed)
             action_hat = self.tanh(action_hat)
-            # weight magnitude and alignment separately
-            magnitude_hat, magnitude = action_hat.norm(dim = -1), action_embed_.norm(dim = -1)
-            mag_loss = mse_loss(magnitude_hat, magnitude)
-            full_magnitude = (magnitude_hat * magnitude)[:, None]
-            align_loss = -(action_hat * action).sum(dim = -1) / full_magnitude.detach()
-            loss_decode = mag_loss + 2 * align_loss.mean()
-        else:
-            loss_decode = torch.tensor(0.0,
-                                       device = obs.device)
-        return loss_state, loss_action, loss_decode
+            loss_action += self.lambda_t * mse_loss(action_hat, action)
+        return loss_state, loss_action
     
     
 class IntrinsicMapLearner(torch.nn.Module):
