@@ -8,9 +8,18 @@ def ortho_loss(x):
                       x, x)
     # set diagonal to zero
     diag = torch.eye(xx.shape[-1], device=xx.device).unsqueeze(0)
-    xx = xx * (1 - diag)
+    xx = (xx**2) * (1 - diag)
     xx /= (2 * b * (b - 1))
     return xx.sum() - (1/b) * (x**2).sum()
+
+class SphereNorm(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        norm = torch.norm(x, p=2, dim=self.dim, keepdim=True)
+        return x / (norm + 1e-8)
 
 class MLPEmbed(torch.nn.Module):
     def __init__(self,
@@ -52,7 +61,7 @@ class TDJEncoders(torch.nn.Module):
             first_stage,
             torch.nn.ReLU(),
             torch.nn.Linear(hidden_dim, hidden_dim),
-            torch.nn.LayerNorm(hidden_dim))
+            SphereNorm(dim = 1))
         if exp_conv_out_size is None:
             first_stage_task = torch.nn.Linear(in_size, hidden_dim)
         else:
@@ -68,7 +77,7 @@ class TDJEncoders(torch.nn.Module):
             torch.nn.Linear(hidden_dim, hidden_dim),
             torch.nn.ReLU(),
             torch.nn.Linear(hidden_dim, hidden_dim),
-            torch.nn.LayerNorm(hidden_dim))
+            SphereNorm(dim=1))
         self.state_encoder = state_encoder
         self.task_encoder = task_encoder
 
@@ -125,21 +134,27 @@ class TDJActor(torch.nn.Module):
                  state_dim,
                  hidden_dim = 256,
                  out_dim = 10,
+                 noise_scale = 0.2,
                  out_activation = torch.nn.Tanh()):
         super().__init__()
+        self.noise_scale = noise_scale
         self.task_embed = MLPEmbed(task_dim, 2 * hidden_dim, hidden_dim)
         self.state_embed = MLPEmbed(state_dim, 2 * hidden_dim, hidden_dim)
         self.actor = torch.nn.Sequential(
             torch.nn.Linear(hidden_dim, hidden_dim),
             torch.nn.ReLU(),
-            torch.nn.Linear(hidden_dim, out_dim),
-            out_activation)
+            torch.nn.Linear(hidden_dim, out_dim))
+        self.out_activation = out_activation
         
     def forward(self, task, state):
         task_e = self.task_embed(task * state)
         state_e = self.state_embed(state)
         x = task_e * state_e
         act = self.actor(x)
+        if self.noise_scale > 0:
+            noise = torch.randn_like(act) * self.noise_scale
+            act = act + noise
+        act = self.out_activation(act)
         return act
 
 class TDJEPA(torch.nn.Module):
@@ -173,11 +188,13 @@ class TDJEPA(torch.nn.Module):
         self.ema_predictor = deepcopy(self.predictor).requires_grad_(False)
         self.ema_predictor_task = deepcopy(self.predictor_task).requires_grad_(False)
 
-        self.optimizer = torch.optim.Adam(list(self.encoders.parameters()) +
+        self.optimizer_enc = torch.optim.Adam(self.encoders.parameters(),
+                                              lr = 1e-4)
+        self.optimizer_pred = torch.optim.Adam(
                                           list(self.predictor.parameters()) +
                                           list(self.predictor_task.parameters()),
-                                          lr = 1e-4)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(),
+                                          lr = 3e-4)
+        self.optimizer_act = torch.optim.Adam(self.actor.parameters(),
                                                 lr = 1e-4)
 
     def forward(self, state, task):
@@ -192,8 +209,8 @@ class TDJEPA(torch.nn.Module):
             alt_action = self.actor(task = task,
                                     state = state_emb_tgt)
             pred_state_target = self.ema_predictor(context = state_emb_tgt,
-                                                     task = task,
-                                                     action = alt_action)
+                                                   task = task,
+                                                   action = alt_action)
             pred_task_target = self.ema_predictor_task(context = task_emb_tgt,
                                                        task = task,
                                                        action = alt_action)
@@ -220,23 +237,34 @@ class TDJEPA(torch.nn.Module):
         # actor loss
         action_new = self.actor(
             task = task,
-            state = state_emb
+            state = state_emb.detach()
         )
         pred_new_action = self.predictor(
-            context = state_emb,
+            context = state_emb.detach(),
             task = task,
             action = action_new
         )
-        actor_loss = -(pred_new_action * task).mean()
+        actor_loss = -(pred_new_action * task).sum(dim = -1).mean()
         return loss, actor_loss
     
-    def optimizer_steps(self, loss, actor_loss):
-        self.optimizer.zero_grad()
+    def optimizer_steps(self, loss, actor_loss,
+                        clip_grad = 1.0):
+        self.optimizer_enc.zero_grad()
+        self.optimizer_pred.zero_grad()
+        self.optimizer_act.zero_grad()
         loss.backward(retain_graph = True)
-        self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        self.optimizer.step()
-        self.actor_optimizer.step()
+        if clip_grad is not None:
+            torch.nn.utils.clip_grad_norm_(self.encoders.parameters(),
+                                           clip_grad)
+            torch.nn.utils.clip_grad_norm_(list(self.predictor.parameters()) +
+                                           list(self.predictor_task.parameters()),
+                                           clip_grad)
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(),
+                                           clip_grad)
+        self.optimizer_enc.step()
+        self.optimizer_pred.step()
+        self.optimizer_act.step()
 
     def update_ema(self, alpha = 0.995):
         self.ema_encoders.ema(self.encoders, alpha = alpha)
@@ -249,10 +277,15 @@ if __name__ == "__main__":
     from tqdm import tqdm
     import numpy as np
     from utils import ReplayBuffer
+
+    torch.manual_seed(333)
+    np.random.seed(333)
+
     env_name = "Ant-v5"
-    n_epochs = 50 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
+    n_epochs = 500 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
     steps_per_epoch = 32
     batch_size = 256
+    task_dim = 256
     episodes_per_epoch = 1
     train_start_steps = 10000
 
@@ -262,14 +295,17 @@ if __name__ == "__main__":
     action_dim = env.action_space.shape[0]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    #TODO : see how they did task dim given multiplication
     tdjepa = TDJEPA(obs_dim,
-                    task_dim = 256,
+                    task_dim = task_dim,
                     state_dim = 256,
                     action_dim = action_dim,
                     hidden_dim = 256,
                     gamma = 0.999).to(device)
 
-    buffer = ReplayBuffer(obs_dim, action_dim, capacity = int(1e7))
+    buffer = ReplayBuffer(obs_dim, action_dim,
+                          special_buffer_dim=task_dim,
+                          capacity = int(1e7))
 
     total_steps = 0
     pbar = tqdm(total = n_epochs * steps_per_epoch + episodes_per_epoch * n_epochs)
@@ -283,7 +319,10 @@ if __name__ == "__main__":
         for ep in range(episodes_per_epoch):
             policy.eval()
             state, _ = env.reset()
-            task = torch.randn(1, 256).to(device)
+
+            task = torch.randn(1, task_dim).to(device)
+            task = task / (torch.norm(task, p=2, dim=1, keepdim=True) + 1e-8)
+
             done = False
             total_reward = 0
             step = 0
@@ -294,7 +333,8 @@ if __name__ == "__main__":
                     action = tdjepa.actor(task = task,
                                           state = state_emb)
                 next_state, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy()[0])
-                buffer.push(state, action, next_state, done, reward)
+                buffer.push(state, action, next_state, done, reward,
+                            special = task)
                 total_reward += reward
                 state = next_state
 
@@ -315,10 +355,12 @@ if __name__ == "__main__":
         if total_steps > train_start_steps:
             policy.train()
             for _ in range(steps_per_epoch):
-                states, actions, rewards, next_states, dones, _ = buffer.sample(batch_size,
+                states, actions, rewards, next_states, dones, task = buffer.sample(batch_size,
                                                                                     device = device)
-                #TODO : paper is unclear - should this be sampled based on obs?
-                task = torch.randn(batch_size, 256).to(device)
+                if np.random.rand() < 0.5:
+                    # resample task
+                    task = torch.randn(batch_size, task_dim).to(device)
+                    task = task / (torch.norm(task, p=2, dim=1, keepdim=True) + 1e-8)
                 loss, actor_loss = tdjepa.get_losses(state = states,
                                                      next_state = next_states,
                                                      task = task,
