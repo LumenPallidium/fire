@@ -47,6 +47,8 @@ class MLPEmbed(torch.nn.Module):
 class TDJEncoders(torch.nn.Module):
     def __init__(self,
                  in_size,
+                 state_dim,
+                 task_dim,
                  exp_conv_out_size = None,
                  hidden_dim = 256):
         super().__init__()
@@ -60,7 +62,7 @@ class TDJEncoders(torch.nn.Module):
         state_encoder = torch.nn.Sequential(
             first_stage,
             torch.nn.ReLU(),
-            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.Linear(hidden_dim, state_dim),
             SphereNorm(dim = 1))
         if exp_conv_out_size is None:
             first_stage_task = torch.nn.Linear(in_size, hidden_dim)
@@ -76,7 +78,7 @@ class TDJEncoders(torch.nn.Module):
             torch.nn.Tanh(),
             torch.nn.Linear(hidden_dim, hidden_dim),
             torch.nn.ReLU(),
-            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.Linear(hidden_dim, task_dim),
             SphereNorm(dim=1))
         self.state_encoder = state_encoder
         self.task_encoder = task_encoder
@@ -95,28 +97,29 @@ class TDJEncoders(torch.nn.Module):
 class TDJPredictor(torch.nn.Module):
     def __init__(self,
                  task_dim,
+                 state_dim,
                  action_dim,
                  out_dim = None,
                  hidden_dim = 256):
         super().__init__()
         out_dim = out_dim if out_dim is not None else hidden_dim
-        self.task_embed = MLPEmbed(task_dim,
-                                   2 * hidden_dim,
+        self.task_embed = MLPEmbed(task_dim + state_dim,
+                                   hidden_dim,
                                    hidden_dim)
-        self.action_embed = MLPEmbed(action_dim,
-                                     2 * hidden_dim,
+        self.action_embed = MLPEmbed(action_dim + state_dim,
+                                     hidden_dim,
                                      hidden_dim)
         self.predictor = torch.nn.Sequential(
-            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.Linear(2 * hidden_dim, hidden_dim),
             torch.nn.ReLU(),
             torch.nn.Linear(hidden_dim, out_dim))
 
     def forward(self, context, task, action):
-        #TODO : check context is done right
-        task_e = self.task_embed(task * context)
-        # TODO paper says this should be action*context, but that doesn't make sense dimensionally
-        action_e = self.action_embed(action)# * context)
-        x = task_e * action_e
+        task_context = torch.cat([task, context], dim = -1)
+        task_e = self.task_embed(task_context)
+        action_context = torch.cat([action, context], dim = -1)
+        action_e = self.action_embed(action_context)
+        x = torch.cat([task_e, action_e], dim = -1)
         pred = self.predictor(x)
         return pred
     
@@ -138,18 +141,21 @@ class TDJActor(torch.nn.Module):
                  out_activation = torch.nn.Tanh()):
         super().__init__()
         self.noise_scale = noise_scale
-        self.task_embed = MLPEmbed(task_dim, 2 * hidden_dim, hidden_dim)
-        self.state_embed = MLPEmbed(state_dim, 2 * hidden_dim, hidden_dim)
+        self.task_embed = MLPEmbed(task_dim + state_dim,
+                                   hidden_dim, hidden_dim)
+        self.state_embed = MLPEmbed(state_dim,
+                                    hidden_dim, hidden_dim)
         self.actor = torch.nn.Sequential(
-            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.Linear(2 * hidden_dim, hidden_dim),
             torch.nn.ReLU(),
             torch.nn.Linear(hidden_dim, out_dim))
         self.out_activation = out_activation
         
     def forward(self, task, state):
-        task_e = self.task_embed(task * state)
+        task_state = torch.cat([task, state], dim = -1)
+        task_e = self.task_embed(task_state)
         state_e = self.state_embed(state)
-        x = task_e * state_e
+        x = torch.cat([task_e, state_e], dim = -1)
         act = self.actor(x)
         if self.noise_scale > 0:
             noise = torch.randn_like(act) * self.noise_scale
@@ -170,13 +176,17 @@ class TDJEPA(torch.nn.Module):
 
         self.gamma = gamma
         self.encoders = TDJEncoders(in_size,
+                                    state_dim = state_dim,
+                                    task_dim = task_dim,
                                     hidden_dim = hidden_dim,
                                     exp_conv_out_size = exp_conv_out_size,)
         self.predictor = TDJPredictor(task_dim,
+                                      state_dim = state_dim,
                                       action_dim = action_dim,
                                       hidden_dim = hidden_dim,
                                       out_dim = task_dim)
-        self.predictor_task = TDJPredictor(state_dim,
+        self.predictor_task = TDJPredictor(task_dim,
+                                           state_dim = task_dim,
                                            action_dim = action_dim,
                                            hidden_dim = hidden_dim,
                                            out_dim = state_dim)
@@ -193,7 +203,7 @@ class TDJEPA(torch.nn.Module):
         self.optimizer_pred = torch.optim.Adam(
                                           list(self.predictor.parameters()) +
                                           list(self.predictor_task.parameters()),
-                                          lr = 3e-4)
+                                          lr = 2e-4)
         self.optimizer_act = torch.optim.Adam(self.actor.parameters(),
                                                 lr = 1e-4)
 
@@ -205,13 +215,13 @@ class TDJEPA(torch.nn.Module):
     
     def get_losses(self, state, task, action, next_state, reg_lambda = 1,):
         with torch.no_grad():
-            state_emb_tgt, task_emb_tgt = self.ema_encoders(state = next_state)
+            state_emb_target, task_emb_target = self.ema_encoders(state = next_state)
             alt_action = self.actor(task = task,
-                                    state = state_emb_tgt)
-            pred_state_target = self.ema_predictor(context = state_emb_tgt,
+                                    state = state_emb_target)
+            pred_state_target = self.ema_predictor(context = state_emb_target,
                                                    task = task,
                                                    action = alt_action)
-            pred_task_target = self.ema_predictor_task(context = task_emb_tgt,
+            pred_task_target = self.ema_predictor_task(context = task_emb_target,
                                                        task = task,
                                                        action = alt_action)
         state_emb, task_emb = self.encoders(state = state)
@@ -226,9 +236,9 @@ class TDJEPA(torch.nn.Module):
             action = action
         )
         phi_loss = torch.nn.functional.mse_loss(pred,
-                                                self.gamma * pred_state_target + task_emb_tgt)
+                                                self.gamma * pred_state_target + task_emb_target)
         psi_loss = torch.nn.functional.mse_loss(pred_task,
-                                                self.gamma * pred_task_target + state_emb_tgt)
+                                                self.gamma * pred_task_target + state_emb_target)
         loss = 0.5 * (phi_loss + psi_loss)
 
         loss_reg = reg_lambda * (ortho_loss(state_emb) +
@@ -283,11 +293,12 @@ if __name__ == "__main__":
 
     env_name = "Ant-v5"
     n_epochs = 500 # 3000 epochs at 8x8 steps/episodes per epoch ~~ 1.5hrs on RTX 3090
-    steps_per_epoch = 32
+    steps_per_epoch = 4
     batch_size = 256
-    task_dim = 256
+    task_dim = 50
     episodes_per_epoch = 1
     train_start_steps = 10000
+    gamma = 0.5
 
     env = gym.make(env_name,
                    forward_reward_weight = 0.0,)
@@ -301,13 +312,14 @@ if __name__ == "__main__":
                     state_dim = 256,
                     action_dim = action_dim,
                     hidden_dim = 256,
-                    gamma = 0.999).to(device)
+                    gamma = gamma).to(device)
 
     buffer = ReplayBuffer(obs_dim, action_dim,
                           special_buffer_dim=task_dim,
                           capacity = int(1e7))
 
     total_steps = 0
+    #TODO : this is not right
     pbar = tqdm(total = n_epochs * steps_per_epoch + episodes_per_epoch * n_epochs)
     losses = []
     total_rewards = []
@@ -351,16 +363,17 @@ if __name__ == "__main__":
         # update steps_per_epoch based on episodes collected
         buffer_size = len(buffer)
         # seems like a nice heuristic
-        steps_per_epoch = min(300, max(32, buffer_size // (10 * batch_size)))
+        steps_per_epoch = min(100, max(4, buffer_size // (100 * batch_size)))
         if total_steps > train_start_steps:
             policy.train()
             for _ in range(steps_per_epoch):
                 states, actions, rewards, next_states, dones, task = buffer.sample(batch_size,
                                                                                     device = device)
-                if np.random.rand() < 0.5:
-                    # resample task
-                    task = torch.randn(batch_size, task_dim).to(device)
-                    task = task / (torch.norm(task, p=2, dim=1, keepdim=True) + 1e-8)
+                rand_task = torch.randn(batch_size, task_dim).to(device)
+                rand_task = rand_task / (torch.norm(rand_task, p=2, dim=1, keepdim=True) + 1e-8)
+                mask = torch.rand(batch_size, 1).to(device) < 0.5
+                task = torch.where(mask, task, rand_task)
+
                 loss, actor_loss = tdjepa.get_losses(state = states,
                                                      next_state = next_states,
                                                      task = task,
