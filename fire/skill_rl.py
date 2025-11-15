@@ -2,7 +2,7 @@ import os
 import torch
 import numpy as np
 from gymnasium import make
-from utils import ReplayBuffer, NormedSparseMLP, SACWrapper, SkillConditionedPolicy, TDJEPA
+from utils import ReplayBuffer, NormedSparseMLP, SACWrapper, SkillConditionedPolicy
 from copy import deepcopy
 from tqdm import tqdm
 
